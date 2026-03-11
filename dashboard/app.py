@@ -2,7 +2,6 @@ import requests
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 import dash
 from dash import dcc, html, Input, Output, callback
 import dash_bootstrap_components as dbc
@@ -11,13 +10,45 @@ import dash_bootstrap_components as dbc
 BASE_URL  = "http://uno.ucc.uwm.edu/odata/435"
 AUTH      = ("A_1", "legoman99")
 COMPANY   = "AA"
-REFRESH_S = 60          # auto-refresh interval (seconds)
+REFRESH_S = 20
 
 CHANNEL_MAP = {"12": "Wholesale", "14": "Retail"}
 LOC_MAP     = {"02": "Central", "02N": "North", "02S": "South", "02W": "West"}
+STEPS_PER_ROUND = 20
+PROD_WARN_THRESHOLD = 120_000
 
-# ── Data helpers ──────────────────────────────────────────────────────────────
-def fetch(entity: str) -> pd.DataFrame:
+WAREHOUSE_CAPACITY = {
+    "Finished Goods": 250_000,
+    "Raw Materials":  250_000,
+    "Packaging":      750_000,
+}
+MAT_TYPE_MAP = {"F": "Finished Goods", "R": "Raw Materials", "P": "Packaging"}
+
+# ── Colour palette ─────────────────────────────────────────────────────────────
+COLORS  = px.colors.qualitative.Safe
+BG      = "#0f1117"
+CARD_BG = "#1a1d27"
+ACCENT  = "#4f8ef7"
+GREEN   = "#2ecc71"
+RED     = "#e74c3c"
+YELLOW  = "#f39c12"
+
+STATUS_COLORS = {
+    "Completed":   "#2ecc71",
+    "In Progress": "#f39c12",
+    "Up Next":     "#4f8ef7",
+    "Queued":      "#4a4f6a",
+}
+
+_VAL_EMPTY = {
+    "COMPANY_VALUATION": 0, "BANK_CASH_ACCOUNT": 0, "BANK_LOAN": 0,
+    "PROFIT": 0, "COMPANY_RISK_RATE_PCT": 0, "MARKET_RISK_RATE_PCT": 0,
+    "CREDIT_RATING": "—", "SIM_ELAPSED_STEPS": 0, "SIM_ROUND": "—", "SIM_DATE": "—",
+    "DEBT_LOADING": 0,
+}
+
+# ── Data helpers ───────────────────────────────────────────────────────────────
+def fetch(entity):
     url = f"{BASE_URL}/{entity}?$format=json"
     resp = requests.get(url, auth=AUTH, timeout=30)
     resp.raise_for_status()
@@ -26,16 +57,13 @@ def fetch(entity: str) -> pd.DataFrame:
     df.drop(columns=["__metadata"], errors="ignore", inplace=True)
     return df
 
-def to_num(df: pd.DataFrame, cols: list) -> pd.DataFrame:
+def to_num(df, cols):
     for c in cols:
         if c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
     return df
 
-STEPS_PER_ROUND = 20   # ERPsim simulation steps per round
-
-def rs_to_elapsed(round_str, step_str) -> int:
-    """Convert '04/02' style round/step to absolute elapsed step number."""
+def rs_to_elapsed(round_str, step_str):
     try:
         return (int(round_str) - 1) * STEPS_PER_ROUND + int(step_str)
     except Exception:
@@ -49,18 +77,18 @@ def load_all():
     carbon      = fetch("Carbon_Emissions")
     prod        = fetch("Production")
     prod_orders = fetch("Production_Orders")
+    inv_hist    = fetch("Inventory")
 
     sales       = to_num(sales,       ["QUANTITY","QUANTITY_DELIVERED","NET_PRICE","NET_VALUE","COST","SIM_ELAPSED_STEPS","SIM_PERIOD"])
     valuation   = to_num(valuation,   ["BANK_CASH_ACCOUNT","ACCOUNTS_RECEIVABLE","BANK_LOAN",
                                        "ACCOUNTS_PAYABLE","PROFIT","COMPANY_VALUATION",
-                                       "COMPANY_RISK_RATE_PCT","MARKET_RISK_RATE_PCT","SIM_ELAPSED_STEPS"])
+                                       "COMPANY_RISK_RATE_PCT","MARKET_RISK_RATE_PCT","SIM_ELAPSED_STEPS","DEBT_LOADING"])
     inv_kpi     = to_num(inv_kpi,     ["CURRENT_INVENTORY","QUANTITY_SOLD","NB_STEPS_AVAILABLE","SIM_ELAPSED_STEPS"])
     market      = to_num(market,      ["QUANTITY","AVERAGE_PRICE","NET_VALUE","SIM_PERIOD"])
     carbon      = to_num(carbon,      ["CO2E_EMISSIONS","TOTAL_CO2E_EMISSIONS","SIM_ELAPSED_STEPS"])
     prod        = to_num(prod,        ["SIM_ELAPSED_STEPS"])
     prod_orders = to_num(prod_orders, ["SIM_ELAPSED_STEPS","TARGET_QUANTITY","CONFIRMED_QUANTITY","SETUP_TIME"])
 
-    # derived columns (guard against empty datasets between sim rounds)
     if not sales.empty and "NET_VALUE" in sales.columns:
         sales["MARGIN"]  = sales["NET_VALUE"] - sales["COST"]
         sales["CHANNEL"] = sales["DISTRIBUTION_CHANNEL"].map(CHANNEL_MAP).fillna(sales["DISTRIBUTION_CHANNEL"])
@@ -68,14 +96,15 @@ def load_all():
     else:
         for col in ["MARGIN","CHANNEL","REGION","NET_VALUE","COST","QUANTITY","NET_PRICE"]:
             sales[col] = pd.Series(dtype=float)
+
     if not inv_kpi.empty and "STORAGE_LOCATION" in inv_kpi.columns:
         inv_kpi["REGION"] = inv_kpi["STORAGE_LOCATION"].map(LOC_MAP).fillna(inv_kpi["STORAGE_LOCATION"])
 
-    # ── Production Orders: keep only the latest planning snapshot ──────────
     if not prod.empty and "YIELD" in prod.columns:
         prod["YIELD"] = pd.to_numeric(prod["YIELD"], errors="coerce")
     else:
         prod["YIELD"] = pd.Series(dtype=float)
+
     if not prod_orders.empty and "SIM_ELAPSED_STEPS" in prod_orders.columns:
         latest_po_step = prod_orders["SIM_ELAPSED_STEPS"].max()
         prod_orders = prod_orders[prod_orders["SIM_ELAPSED_STEPS"] == latest_po_step].copy()
@@ -92,70 +121,59 @@ def load_all():
                     "MATERIAL_DESCRIPTION","PRODUCTION_ORDER"]:
             prod_orders[col] = pd.Series(dtype=object)
 
-    return sales, valuation, inv_kpi, market, carbon, prod, prod_orders
+    inv_hist = to_num(inv_hist, ["INVENTORY_OPENING_BALANCE", "SIM_ELAPSED_STEPS"])
+    if not inv_hist.empty and "MATERIAL_NUMBER" in inv_hist.columns:
+        inv_hist["MAT_TYPE"] = inv_hist["MATERIAL_NUMBER"].str[3].map(MAT_TYPE_MAP).fillna("Other")
+    else:
+        inv_hist["MAT_TYPE"] = pd.Series(dtype=str)
 
-# ── Load data ─────────────────────────────────────────────────────────────────
-sales, valuation, inv_kpi, market, carbon, prod, prod_orders = load_all()
+    return sales, valuation, inv_kpi, market, carbon, prod, prod_orders, inv_hist
 
-# ── Latest snapshot values ────────────────────────────────────────────────────
-_VAL_EMPTY = {"COMPANY_VALUATION":0,"BANK_CASH_ACCOUNT":0,"BANK_LOAN":0,
-              "PROFIT":0,"COMPANY_RISK_RATE_PCT":0,"MARKET_RISK_RATE_PCT":0,
-              "CREDIT_RATING":"—","SIM_ELAPSED_STEPS":0,"SIM_ROUND":"—","SIM_DATE":"—"}
-latest_val   = valuation.sort_values("SIM_ELAPSED_STEPS").iloc[-1] if not valuation.empty else pd.Series(_VAL_EMPTY)
-total_revenue = sales["NET_VALUE"].sum() if not sales.empty else 0.0
-total_margin  = sales["MARGIN"].sum()  if not sales.empty else 0.0
-total_qty     = sales["QUANTITY"].sum() if not sales.empty else 0.0
-total_co2     = carbon["CO2E_EMISSIONS"].sum() if not carbon.empty else 0.0
+def compute_derived(sales, valuation, inv_kpi, carbon, prod, prod_orders):
+    latest_val     = valuation.sort_values("SIM_ELAPSED_STEPS").iloc[-1] if not valuation.empty else pd.Series(_VAL_EMPTY)
+    total_revenue  = sales["NET_VALUE"].sum() if not sales.empty else 0.0
+    total_margin   = sales["MARGIN"].sum()    if not sales.empty else 0.0
+    total_co2      = carbon["CO2E_EMISSIONS"].sum() if not carbon.empty else 0.0
+    current_elapsed = int(inv_kpi["SIM_ELAPSED_STEPS"].max()) if (not inv_kpi.empty and "SIM_ELAPSED_STEPS" in inv_kpi.columns) else 0
+    total_produced  = prod["YIELD"].sum() if not prod.empty else 0.0
+    avg_yield_step  = prod.groupby("SIM_ELAPSED_STEPS")["YIELD"].sum().mean() if (not prod.empty and "SIM_ELAPSED_STEPS" in prod.columns) else 0.0
 
-# ── Production KPIs ───────────────────────────────────────────────────────────
-PROD_WARN_THRESHOLD = 120_000
-current_elapsed = int(inv_kpi["SIM_ELAPSED_STEPS"].max()) if (not inv_kpi.empty and "SIM_ELAPSED_STEPS" in inv_kpi.columns) else 0
-prod["YIELD"]   = pd.to_numeric(prod["YIELD"], errors="coerce") if (not prod.empty and "YIELD" in prod.columns) else pd.Series(dtype=float)
-total_produced  = prod["YIELD"].sum() if not prod.empty else 0.0
-avg_yield_step  = prod.groupby("SIM_ELAPSED_STEPS")["YIELD"].sum().mean() if (not prod.empty and "SIM_ELAPSED_STEPS" in prod.columns) else 0.0
-
-# Classify each order
-def classify_order(row, cur):
-    if row["CONFIRMED_QUANTITY"] > 0:
+    def classify_order(row, cur):
+        if row["CONFIRMED_QUANTITY"] > 0:
+            return "Completed"
+        if row["BEGIN_ELAPSED"] <= cur <= row["END_ELAPSED"]:
+            return "In Progress"
+        if row["BEGIN_ELAPSED"] > cur:
+            return "Queued"
         return "Completed"
-    if row["BEGIN_ELAPSED"] <= cur <= row["END_ELAPSED"]:
-        return "In Progress"
-    if row["BEGIN_ELAPSED"] > cur:
-        return "Queued"
-    return "Completed"
 
-if not prod_orders.empty and "BEGIN_ELAPSED" in prod_orders.columns:
-    prod_orders["STATUS"] = prod_orders.apply(lambda r: classify_order(r, current_elapsed), axis=1)
-    queued_idx = prod_orders[prod_orders["STATUS"] == "Queued"].index
-    if len(queued_idx):
-        prod_orders.at[queued_idx[0], "STATUS"] = "Up Next"
-else:
-    prod_orders["STATUS"] = pd.Series(dtype=str)
+    if not prod_orders.empty and "BEGIN_ELAPSED" in prod_orders.columns:
+        prod_orders = prod_orders.copy()
+        prod_orders["STATUS"] = prod_orders.apply(lambda r: classify_order(r, current_elapsed), axis=1)
+        queued_idx = prod_orders[prod_orders["STATUS"] == "Queued"].index
+        if len(queued_idx):
+            prod_orders.at[queued_idx[0], "STATUS"] = "Up Next"
+    else:
+        prod_orders = prod_orders.copy()
+        prod_orders["STATUS"] = pd.Series(dtype=str)
 
-in_progress_orders = prod_orders[prod_orders["STATUS"] == "In Progress"] if "STATUS" in prod_orders.columns else prod_orders.iloc[0:0]
-up_next_orders     = prod_orders[prod_orders["STATUS"] == "Up Next"]     if "STATUS" in prod_orders.columns else prod_orders.iloc[0:0]
-queued_orders      = prod_orders[prod_orders["STATUS"] == "Queued"]      if "STATUS" in prod_orders.columns else prod_orders.iloc[0:0]
-pending_orders     = prod_orders[prod_orders["STATUS"].isin(["Up Next","Queued","In Progress"])] if "STATUS" in prod_orders.columns else prod_orders.iloc[0:0]
-total_to_produce   = int(pending_orders["TARGET_QUANTITY"].sum()) if (not pending_orders.empty and "TARGET_QUANTITY" in pending_orders.columns) else 0
+    in_progress = prod_orders[prod_orders["STATUS"] == "In Progress"] if "STATUS" in prod_orders.columns else prod_orders.iloc[0:0]
+    up_next     = prod_orders[prod_orders["STATUS"] == "Up Next"]     if "STATUS" in prod_orders.columns else prod_orders.iloc[0:0]
+    pending     = prod_orders[prod_orders["STATUS"].isin(["Up Next","Queued","In Progress"])] if "STATUS" in prod_orders.columns else prod_orders.iloc[0:0]
+    total_to_produce = int(pending["TARGET_QUANTITY"].sum()) if (not pending.empty and "TARGET_QUANTITY" in pending.columns) else 0
 
-# ── Colour palette ────────────────────────────────────────────────────────────
-COLORS  = px.colors.qualitative.Safe
-BG      = "#0f1117"
-CARD_BG = "#1a1d27"
-ACCENT  = "#4f8ef7"
-GREEN   = "#2ecc71"
-RED     = "#e74c3c"
-YELLOW  = "#f39c12"
+    return (latest_val, total_revenue, total_margin, total_co2,
+            current_elapsed, total_produced, avg_yield_step,
+            in_progress, up_next, pending, total_to_produce, prod_orders)
 
-def kpi_card(title, value, sub=None, color=ACCENT):
-    return dbc.Card([
-        dbc.CardBody([
-            html.P(title, className="text-muted mb-1", style={"fontSize":"0.8rem","textTransform":"uppercase","letterSpacing":"0.05em"}),
-            html.H4(value, style={"color": color, "fontWeight":"700", "marginBottom":"2px"}),
-            html.Small(sub or "", className="text-muted"),
-        ])
-    ], style={"background": CARD_BG, "border":"1px solid #2a2d3e", "borderRadius":"10px"}, className="h-100")
+# ── Initial load ───────────────────────────────────────────────────────────────
+sales, valuation, inv_kpi, market, carbon, prod, prod_orders, inv_hist = load_all()
+(latest_val, total_revenue, total_margin, total_co2,
+ current_elapsed, total_produced, avg_yield_step,
+ in_progress_orders, up_next_orders, pending_orders, total_to_produce,
+ prod_orders) = compute_derived(sales, valuation, inv_kpi, carbon, prod, prod_orders)
 
+# ── UI helpers ─────────────────────────────────────────────────────────────────
 def empty_fig(msg="No data yet — waiting for simulation to start"):
     fig = go.Figure()
     fig.add_annotation(text=msg, xref="paper", yref="paper",
@@ -165,7 +183,6 @@ def empty_fig(msg="No data yet — waiting for simulation to start"):
     return fig
 
 def safe(fn):
-    """Decorator: return empty_fig if the chart function raises (e.g. empty data)."""
     def wrapper(*args, **kwargs):
         try:
             return fn(*args, **kwargs)
@@ -173,7 +190,7 @@ def safe(fn):
             return empty_fig()
     return wrapper
 
-def chart_card(title, fig):
+def style_fig(fig):
     fig.update_layout(
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
@@ -183,16 +200,34 @@ def chart_card(title, fig):
     )
     fig.update_xaxes(gridcolor="#2a2d3e", zeroline=False)
     fig.update_yaxes(gridcolor="#2a2d3e", zeroline=False)
+    return fig
+
+def kpi_card(title, value, sub=None, color=ACCENT):
     return dbc.Card([
         dbc.CardBody([
-            html.H6(title, className="mb-3", style={"color":"#8b90a0","textTransform":"uppercase","letterSpacing":"0.08em","fontSize":"0.75rem"}),
-            dcc.Graph(figure=fig, config={"displayModeBar": False}, style={"height":"280px"}),
+            html.P(title, className="text-muted mb-1",
+                   style={"fontSize":"0.8rem","textTransform":"uppercase","letterSpacing":"0.05em"}),
+            html.H4(value, style={"color": color, "fontWeight":"700", "marginBottom":"2px"}),
+            html.Small(sub or "", className="text-muted"),
+        ])
+    ], style={"background": CARD_BG, "border":"1px solid #2a2d3e", "borderRadius":"10px"}, className="h-100")
+
+def chart_card(title, graph_id, fig=None):
+    if fig is not None:
+        fig = style_fig(fig)
+    return dbc.Card([
+        dbc.CardBody([
+            html.H6(title, className="mb-3",
+                    style={"color":"#8b90a0","textTransform":"uppercase",
+                           "letterSpacing":"0.08em","fontSize":"0.75rem"}),
+            dcc.Graph(id=graph_id, figure=fig or empty_fig(),
+                      config={"displayModeBar": False}, style={"height":"280px"}),
         ])
     ], style={"background": CARD_BG, "border":"1px solid #2a2d3e", "borderRadius":"10px"})
 
-# ── Chart builders ────────────────────────────────────────────────────────────
+# ── Chart builders (accept data as arguments) ──────────────────────────────────
 @safe
-def fig_valuation_over_time():
+def fig_valuation_over_time(valuation):
     df = valuation.sort_values("SIM_ELAPSED_STEPS")
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=df["SIM_ELAPSED_STEPS"], y=df["COMPANY_VALUATION"],
@@ -206,20 +241,21 @@ def fig_valuation_over_time():
     return fig
 
 @safe
-def fig_cash_and_debt():
+def fig_cash_and_debt(valuation):
     df = valuation.sort_values("SIM_ELAPSED_STEPS")
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=df["SIM_ELAPSED_STEPS"], y=df["BANK_CASH_ACCOUNT"],
                              name="Cash", mode="lines", line=dict(color=GREEN, width=2)))
     fig.add_trace(go.Scatter(x=df["SIM_ELAPSED_STEPS"], y=df["BANK_LOAN"],
                              name="Bank Loan", mode="lines", line=dict(color=RED, width=2)))
-    fig.add_trace(go.Scatter(x=df["SIM_ELAPSED_STEPS"], y=df["DEBT_LOADING"],
-                             name="Net Debt Loading", mode="lines",
-                             line=dict(color=YELLOW, width=2, dash="dash")))
+    if "DEBT_LOADING" in df.columns:
+        fig.add_trace(go.Scatter(x=df["SIM_ELAPSED_STEPS"], y=df["DEBT_LOADING"],
+                                 name="Net Debt Loading", mode="lines",
+                                 line=dict(color=YELLOW, width=2, dash="dash")))
     return fig
 
 @safe
-def fig_sales_by_period():
+def fig_sales_by_period(sales):
     df = sales.groupby(["SIM_PERIOD","SIM_ELAPSED_STEPS"], as_index=False).agg(
         Revenue=("NET_VALUE","sum"), Margin=("MARGIN","sum"))
     df = df.sort_values("SIM_ELAPSED_STEPS")
@@ -234,7 +270,17 @@ def fig_sales_by_period():
     return fig
 
 @safe
-def fig_revenue_by_product():
+def fig_production_over_time(prod):
+    prod2 = prod.copy()
+    prod2["YIELD"] = pd.to_numeric(prod2["YIELD"], errors="coerce")
+    df = prod2.groupby(["SIM_ELAPSED_STEPS","MATERIAL_DESCRIPTION"], as_index=False)["YIELD"].sum()
+    fig = px.bar(df, x="SIM_ELAPSED_STEPS", y="YIELD", color="MATERIAL_DESCRIPTION",
+                 color_discrete_sequence=COLORS, barmode="stack",
+                 labels={"SIM_ELAPSED_STEPS":"Step","YIELD":"Units Produced"})
+    return fig
+
+@safe
+def fig_revenue_by_product(sales):
     df = sales.groupby("MATERIAL_DESCRIPTION", as_index=False)["NET_VALUE"].sum()
     df = df.sort_values("NET_VALUE", ascending=True)
     fig = px.bar(df, x="NET_VALUE", y="MATERIAL_DESCRIPTION", orientation="h",
@@ -244,7 +290,7 @@ def fig_revenue_by_product():
     return fig
 
 @safe
-def fig_sales_by_region():
+def fig_sales_by_region(sales):
     df = sales.groupby("REGION", as_index=False)["NET_VALUE"].sum()
     fig = px.pie(df, names="REGION", values="NET_VALUE", hole=0.55,
                  color_discrete_sequence=COLORS)
@@ -252,14 +298,14 @@ def fig_sales_by_region():
     return fig
 
 @safe
-def fig_channel_split():
+def fig_channel_split(sales):
     df = sales.groupby("CHANNEL", as_index=False).agg(Revenue=("NET_VALUE","sum"), Margin=("MARGIN","sum"))
     fig = px.bar(df, x="CHANNEL", y=["Revenue","Margin"],
                  barmode="group", color_discrete_map={"Revenue":ACCENT,"Margin":GREEN})
     return fig
 
 @safe
-def fig_inventory_kpi():
+def fig_inventory_kpi(inv_kpi):
     df = inv_kpi.groupby(["MATERIAL_DESCRIPTION","REGION"], as_index=False).agg(
         Stock=("CURRENT_INVENTORY","sum"), DaysAvail=("NB_STEPS_AVAILABLE","mean"))
     fig = px.bar(df, x="MATERIAL_DESCRIPTION", y="Stock", color="REGION",
@@ -269,7 +315,7 @@ def fig_inventory_kpi():
     return fig
 
 @safe
-def fig_days_available():
+def fig_days_available(inv_kpi):
     df = inv_kpi.groupby("MATERIAL_DESCRIPTION", as_index=False)["NB_STEPS_AVAILABLE"].mean()
     df = df.sort_values("NB_STEPS_AVAILABLE")
     colors = [RED if v < 10 else (YELLOW if v < 20 else GREEN) for v in df["NB_STEPS_AVAILABLE"]]
@@ -279,9 +325,62 @@ def fig_days_available():
     fig.add_vline(x=10, line_dash="dash", line_color=RED, annotation_text="Warning")
     return fig
 
+def make_capacity_section(inv_hist):
+    """Build warehouse capacity progress bar cards from latest inventory snapshot."""
+    if inv_hist.empty or "SIM_ELAPSED_STEPS" not in inv_hist.columns:
+        usage = {"Finished Goods": 0, "Raw Materials": 0, "Packaging": 0}
+    else:
+        latest_step = inv_hist["SIM_ELAPSED_STEPS"].max()
+        df = inv_hist[inv_hist["SIM_ELAPSED_STEPS"] == latest_step]
+        usage = df.groupby("MAT_TYPE")["INVENTORY_OPENING_BALANCE"].sum().to_dict()
+
+    cards = []
+    for label, cap in WAREHOUSE_CAPACITY.items():
+        current = int(usage.get(label, 0))
+        pct = min(current / cap * 100, 100) if cap else 0
+        bar_color = RED if pct >= 90 else (YELLOW if pct >= 70 else GREEN)
+        cards.append(dbc.Col(dbc.Card([
+            dbc.CardBody([
+                html.P(label, className="text-muted mb-1",
+                       style={"fontSize":"0.8rem","textTransform":"uppercase","letterSpacing":"0.05em"}),
+                html.Div([
+                    html.Span(f"{current:,}", style={"color":"#fff","fontWeight":"700","fontSize":"1.1rem"}),
+                    html.Span(f" / {cap:,}", style={"color":"#8b90a0","fontSize":"0.9rem"}),
+                ], style={"marginBottom":"8px"}),
+                dbc.Progress(value=pct, style={"height":"10px","borderRadius":"5px"},
+                             color=bar_color if bar_color != RED else "danger",
+                             className="mb-1"),
+                html.Small(f"{pct:.1f}% used{' — ⚠ Nearly Full!' if pct >= 90 else (' — Getting Full' if pct >= 70 else '')}",
+                           style={"color": bar_color}),
+            ])
+        ], style={"background": CARD_BG, "border": f"1px solid {bar_color}",
+                  "borderRadius":"10px"}), md=4))
+    return cards
+
 @safe
-def fig_market_share():
-    # company sales vs total market by product/period
+def fig_inventory_history_by_type(inv_hist):
+    """Line chart showing inventory levels over time by warehouse type."""
+    df = inv_hist.groupby(["SIM_ELAPSED_STEPS","MAT_TYPE"], as_index=False)["INVENTORY_OPENING_BALANCE"].sum()
+    fig = go.Figure()
+    type_colors = {"Finished Goods": ACCENT, "Raw Materials": GREEN, "Packaging": YELLOW}
+    for mat_type, cap in WAREHOUSE_CAPACITY.items():
+        sub = df[df["MAT_TYPE"] == mat_type].sort_values("SIM_ELAPSED_STEPS")
+        fig.add_trace(go.Scatter(
+            x=sub["SIM_ELAPSED_STEPS"], y=sub["INVENTORY_OPENING_BALANCE"],
+            name=mat_type, mode="lines+markers",
+            line=dict(color=type_colors.get(mat_type, "#8b90a0"), width=2),
+        ))
+        fig.add_hline(y=cap, line_dash="dot",
+                      line_color=type_colors.get(mat_type, "#8b90a0"),
+                      opacity=0.4,
+                      annotation_text=f"{mat_type} cap ({cap:,})",
+                      annotation_font_color=type_colors.get(mat_type, "#8b90a0"),
+                      annotation_position="right")
+    fig.update_layout(hovermode="x unified", yaxis_title="Units in Stock")
+    return fig
+
+@safe
+def fig_market_share(sales, market):
     our  = sales.groupby(["SIM_PERIOD","MATERIAL_DESCRIPTION"], as_index=False)["QUANTITY"].sum()
     our.rename(columns={"QUANTITY":"OurQty"}, inplace=True)
     mkt  = market.groupby(["SIM_PERIOD","MATERIAL_DESCRIPTION"], as_index=False)["QUANTITY"].sum()
@@ -295,16 +394,15 @@ def fig_market_share():
     return fig
 
 @safe
-def fig_carbon_by_type():
+def fig_carbon_by_type(carbon):
     df = carbon.groupby("TYPE", as_index=False)["CO2E_EMISSIONS"].sum()
     fig = px.pie(df, names="TYPE", values="CO2E_EMISSIONS", hole=0.5,
-                 color_discrete_sequence=["#27ae60","#e67e22","#e74c3c","#3498db"],
-                 title="")
+                 color_discrete_sequence=["#27ae60","#e67e22","#e74c3c","#3498db"])
     fig.update_traces(textinfo="label+percent+value")
     return fig
 
 @safe
-def fig_carbon_over_time():
+def fig_carbon_over_time(carbon):
     df = carbon.groupby("SIM_ELAPSED_STEPS", as_index=False)["CO2E_EMISSIONS"].sum()
     df["Cumulative"] = df["CO2E_EMISSIONS"].cumsum()
     fig = go.Figure()
@@ -316,67 +414,45 @@ def fig_carbon_over_time():
     fig.update_layout(yaxis2=dict(overlaying="y", side="right", showgrid=False, color=RED))
     return fig
 
-# ── Production Tab Charts ─────────────────────────────────────────────────────
-
-STATUS_COLORS = {
-    "Completed":  "#2ecc71",
-    "In Progress": "#f39c12",
-    "Up Next":    "#4f8ef7",
-    "Queued":     "#4a4f6a",
-}
-
 @safe
-def fig_prod_gantt():
-    """Horizontal Gantt chart of all production orders."""
+def fig_prod_gantt(prod_orders, current_elapsed):
     fig = go.Figure()
-    # Draw in reverse order so first order appears at top
     for _, row in prod_orders.iloc[::-1].iterrows():
-        begin = row["BEGIN_ELAPSED"]
-        dur   = max(row["END_ELAPSED"] - row["BEGIN_ELAPSED"] + 1, 1)
-        color = STATUS_COLORS.get(row["STATUS"], "#4a4f6a")
-        border= "rgba(255,255,255,0.25)" if row["STATUS"] in ("Up Next","In Progress") else "rgba(0,0,0,0)"
-        label = f"#{row['PRODUCTION_ORDER']}"
-        tip   = (f"<b>{row['MATERIAL_DESCRIPTION']}</b><br>"
-                 f"Order: {row['PRODUCTION_ORDER']}<br>"
-                 f"Target: {int(row['TARGET_QUANTITY']):,} units<br>"
-                 f"Confirmed: {int(row['CONFIRMED_QUANTITY']):,} units<br>"
-                 f"Start: Round {row['BEGIN_LABEL']} → End: Round {row['END_LABEL']}<br>"
-                 f"Setup time: {int(row['SETUP_TIME'])} step(s)<br>"
-                 f"Status: <b>{row['STATUS']}</b>")
+        begin  = row["BEGIN_ELAPSED"]
+        dur    = max(row["END_ELAPSED"] - row["BEGIN_ELAPSED"] + 1, 1)
+        color  = STATUS_COLORS.get(row["STATUS"], "#4a4f6a")
+        border = "rgba(255,255,255,0.25)" if row["STATUS"] in ("Up Next","In Progress") else "rgba(0,0,0,0)"
+        tip = (f"<b>{row['MATERIAL_DESCRIPTION']}</b><br>"
+               f"Order: {row['PRODUCTION_ORDER']}<br>"
+               f"Target: {int(row['TARGET_QUANTITY']):,} units<br>"
+               f"Confirmed: {int(row['CONFIRMED_QUANTITY']):,} units<br>"
+               f"Start: Round {row['BEGIN_LABEL']} → End: Round {row['END_LABEL']}<br>"
+               f"Setup time: {int(row['SETUP_TIME'])} step(s)<br>"
+               f"Status: <b>{row['STATUS']}</b>")
         fig.add_trace(go.Bar(
             x=[dur], y=[row["MATERIAL_DESCRIPTION"]],
             base=[begin], orientation="h",
             marker=dict(color=color, line=dict(color=border, width=2)),
             name=row["STATUS"],
-            text=label, textposition="inside",
+            text=f"#{row['PRODUCTION_ORDER']}", textposition="inside",
             hovertemplate=tip + "<extra></extra>",
             showlegend=False,
         ))
-
-    # Current-step reference line
     fig.add_vline(x=current_elapsed, line_color="#e74c3c", line_dash="dash",
                   annotation_text=f"Now (Step {current_elapsed})",
                   annotation_font_color="#e74c3c", annotation_position="top right")
-
-    # Warning threshold marker (120k label on x-axis context doesn't apply to Gantt time,
-    # so we add a legend manually via invisible scatter)
     for status, color in STATUS_COLORS.items():
         fig.add_trace(go.Scatter(x=[None], y=[None], mode="markers",
                                  marker=dict(color=color, size=10, symbol="square"),
                                  name=status, showlegend=True))
-
-    fig.update_layout(
-        barmode="overlay", hovermode="closest",
-        xaxis_title="Elapsed Simulation Step",
-        yaxis_title="",
-        height=360,
-        legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0),
-    )
+    fig.update_layout(barmode="overlay", hovermode="closest",
+                      xaxis_title="Elapsed Simulation Step", yaxis_title="",
+                      height=360,
+                      legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0))
     return fig
 
 @safe
-def fig_to_be_produced_by_product():
-    """Horizontal bar: planned qty per product, colored by 120k warning threshold."""
+def fig_to_be_produced_by_product(pending_orders):
     df = (pending_orders.groupby("MATERIAL_DESCRIPTION", as_index=False)["TARGET_QUANTITY"].sum()
                         .sort_values("TARGET_QUANTITY"))
     colors = [RED if v <= PROD_WARN_THRESHOLD else (YELLOW if v <= PROD_WARN_THRESHOLD * 2 else GREEN)
@@ -390,29 +466,26 @@ def fig_to_be_produced_by_product():
     return fig
 
 @safe
-def fig_actual_yield_by_product():
-    """Total historical yield per product (bar)."""
-    df = prod.groupby("MATERIAL_DESCRIPTION", as_index=False)["YIELD"].sum()
-    df = df.sort_values("YIELD", ascending=True)
-    fig = px.bar(df, x="YIELD", y="MATERIAL_DESCRIPTION", orientation="h",
-                 color="YIELD", color_continuous_scale=["#1e3a5f", "#2ecc71"],
-                 labels={"YIELD": "Total Units Produced", "MATERIAL_DESCRIPTION": ""})
-    fig.update_coloraxes(showscale=False)
-    return fig
-
-@safe
-def fig_yield_over_time_detail():
-    """Stacked bar of actual yield per step (detail view for Production tab)."""
-    df = prod.groupby(["SIM_ELAPSED_STEPS", "MATERIAL_DESCRIPTION"], as_index=False)["YIELD"].sum()
+def fig_yield_over_time_detail(prod):
+    df = prod.groupby(["SIM_ELAPSED_STEPS","MATERIAL_DESCRIPTION"], as_index=False)["YIELD"].sum()
     fig = px.bar(df, x="SIM_ELAPSED_STEPS", y="YIELD", color="MATERIAL_DESCRIPTION",
                  color_discrete_sequence=COLORS, barmode="stack",
-                 labels={"SIM_ELAPSED_STEPS": "Step", "YIELD": "Units Produced"})
+                 labels={"SIM_ELAPSED_STEPS":"Step","YIELD":"Units Produced"})
     fig.update_layout(hovermode="x unified")
     return fig
 
 @safe
-def fig_setup_time():
-    """Bar showing setup time cost (lost steps) per planned order."""
+def fig_actual_yield_by_product(prod):
+    df = prod.groupby("MATERIAL_DESCRIPTION", as_index=False)["YIELD"].sum()
+    df = df.sort_values("YIELD", ascending=True)
+    fig = px.bar(df, x="YIELD", y="MATERIAL_DESCRIPTION", orientation="h",
+                 color="YIELD", color_continuous_scale=["#1e3a5f","#2ecc71"],
+                 labels={"YIELD":"Total Units Produced","MATERIAL_DESCRIPTION":""})
+    fig.update_coloraxes(showscale=False)
+    return fig
+
+@safe
+def fig_setup_time(prod_orders):
     df = prod_orders[prod_orders["SETUP_TIME"] > 0].copy()
     if df.empty:
         fig = go.Figure()
@@ -421,35 +494,12 @@ def fig_setup_time():
         return fig
     fig = px.bar(df, x="BEGIN_LABEL", y="SETUP_TIME", color="MATERIAL_DESCRIPTION",
                  color_discrete_sequence=COLORS,
-                 labels={"BEGIN_LABEL": "Starts at Round/Step", "SETUP_TIME": "Setup Steps Lost"})
-    fig.add_hline(y=3, line_dash="dot", line_color=YELLOW, annotation_text="Typical 3-step changeover")
+                 labels={"BEGIN_LABEL":"Starts at Round/Step","SETUP_TIME":"Setup Steps Lost"})
+    fig.add_hline(y=3, line_dash="dot", line_color=YELLOW,
+                  annotation_text="Typical 3-step changeover")
     return fig
 
-def prod_order_table(order_df):
-    """Build a styled HTML table for a set of production orders."""
-    if order_df.empty:
-        return html.P("None", className="text-muted", style={"padding": "10px"})
-    rows = []
-    for _, r in order_df.iterrows():
-        status_color = STATUS_COLORS.get(r["STATUS"], "#8b90a0")
-        rows.append(html.Tr([
-            html.Td(r["PRODUCTION_ORDER"],       style={"color":"#8b90a0","fontSize":"0.8rem","padding":"6px 8px"}),
-            html.Td(r["MATERIAL_DESCRIPTION"],   style={"color":"#c8cdd8","padding":"6px 8px","fontWeight":"500"}),
-            html.Td(f"{int(r['TARGET_QUANTITY']):,}", style={"color":ACCENT,"textAlign":"right","padding":"6px 8px"}),
-            html.Td(r["BEGIN_LABEL"],            style={"color":"#8b90a0","textAlign":"center","padding":"6px 8px"}),
-            html.Td(r["END_LABEL"],              style={"color":"#8b90a0","textAlign":"center","padding":"6px 8px"}),
-            html.Td(f"{int(r['SETUP_TIME'])}",   style={"color":YELLOW if r['SETUP_TIME']>0 else "#8b90a0","textAlign":"center","padding":"6px 8px"}),
-            html.Td(r["STATUS"],                 style={"color":status_color,"fontWeight":"600","padding":"6px 8px"}),
-        ]))
-    header = html.Tr([
-        html.Th(h, style={"color":"#8b90a0","fontSize":"0.72rem","textTransform":"uppercase",
-                           "padding":"6px 8px","borderBottom":"1px solid #2a2d3e","textAlign":a})
-        for h, a in [("Order","left"),("Product","left"),("Qty","right"),
-                      ("Start","center"),("End","center"),("Setup","center"),("Status","left")]
-    ])
-    return html.Table([html.Thead(header), html.Tbody(rows)],
-                      style={"width":"100%","borderCollapse":"collapse"})
-
+# ── Production detail components ───────────────────────────────────────────────
 def _info_block(label, value, value_color=ACCENT, sub=None):
     return html.Div([
         html.Div(label, style={"fontSize":"0.7rem","textTransform":"uppercase",
@@ -458,17 +508,16 @@ def _info_block(label, value, value_color=ACCENT, sub=None):
         html.Div(sub or "", style={"fontSize":"0.78rem","color":"#8b90a0","marginTop":"2px"}),
     ], style={"padding":"10px 14px","borderRight":"1px solid #2a2d3e","flex":"1","minWidth":"120px"})
 
-def current_in_production_card():
+def current_in_production_card(in_progress_orders):
     if in_progress_orders.empty:
-        body = html.Div([
-            html.Div("No order currently in production.", className="text-muted",
-                     style={"padding":"14px","fontStyle":"italic"}),
-        ])
+        body = html.Div("No order currently in production.", className="text-muted",
+                        style={"padding":"14px","fontStyle":"italic"})
     else:
         r = in_progress_orders.iloc[0]
         body = html.Div([
             html.Div(r["MATERIAL_DESCRIPTION"],
-                     style={"fontSize":"1rem","fontWeight":"700","color":YELLOW,"marginBottom":"8px","padding":"10px 14px 0"}),
+                     style={"fontSize":"1rem","fontWeight":"700","color":YELLOW,
+                            "marginBottom":"8px","padding":"10px 14px 0"}),
             html.Div([
                 _info_block("Order #",     r["PRODUCTION_ORDER"]),
                 _info_block("Target",      f"{int(r['TARGET_QUANTITY']):,} units"),
@@ -479,17 +528,15 @@ def current_in_production_card():
                             YELLOW if r['SETUP_TIME'] > 0 else GREEN),
             ], style={"display":"flex","flexWrap":"wrap","padding":"0 4px 10px"}),
         ])
-    return dbc.Card([
-        dbc.CardBody([
-            html.H6("Currently In Production",
-                    style={"color":"#8b90a0","textTransform":"uppercase",
-                           "letterSpacing":"0.08em","fontSize":"0.75rem","marginBottom":"10px"}),
-            body,
-        ])
-    ], style={"background": CARD_BG, "border": f"1px solid {YELLOW if not in_progress_orders.empty else '#2a2d3e'}",
-              "borderRadius":"10px", "height":"100%"})
+    border_color = YELLOW if not in_progress_orders.empty else '#2a2d3e'
+    return [
+        html.H6("Currently In Production",
+                style={"color":"#8b90a0","textTransform":"uppercase",
+                       "letterSpacing":"0.08em","fontSize":"0.75rem","marginBottom":"10px"}),
+        body,
+    ], border_color
 
-def up_next_card():
+def up_next_card(up_next_orders, current_elapsed):
     if up_next_orders.empty:
         body = html.Div("No upcoming orders planned.", className="text-muted",
                         style={"padding":"14px","fontStyle":"italic"})
@@ -498,7 +545,8 @@ def up_next_card():
         steps_away = r["BEGIN_ELAPSED"] - current_elapsed
         body = html.Div([
             html.Div(r["MATERIAL_DESCRIPTION"],
-                     style={"fontSize":"1rem","fontWeight":"700","color":ACCENT,"marginBottom":"8px","padding":"10px 14px 0"}),
+                     style={"fontSize":"1rem","fontWeight":"700","color":ACCENT,
+                            "marginBottom":"8px","padding":"10px 14px 0"}),
             html.Div([
                 _info_block("Order #",     r["PRODUCTION_ORDER"]),
                 _info_block("Target",      f"{int(r['TARGET_QUANTITY']):,} units"),
@@ -510,53 +558,41 @@ def up_next_card():
                             YELLOW if r['SETUP_TIME'] > 0 else GREEN),
             ], style={"display":"flex","flexWrap":"wrap","padding":"0 4px 10px"}),
         ])
-    return dbc.Card([
-        dbc.CardBody([
-            html.H6("Up Next",
-                    style={"color":"#8b90a0","textTransform":"uppercase",
-                           "letterSpacing":"0.08em","fontSize":"0.75rem","marginBottom":"10px"}),
-            body,
-        ])
-    ], style={"background": CARD_BG, "border": f"1px solid {ACCENT}",
-              "borderRadius":"10px", "height":"100%"})
+    return [
+        html.H6("Up Next",
+                style={"color":"#8b90a0","textTransform":"uppercase",
+                       "letterSpacing":"0.08em","fontSize":"0.75rem","marginBottom":"10px"}),
+        body,
+    ]
 
-@safe
-def fig_production_over_time():
-    prod2 = prod.copy()
-    prod2["YIELD"] = pd.to_numeric(prod2["YIELD"], errors="coerce")
-    df = prod2.groupby(["SIM_ELAPSED_STEPS","MATERIAL_DESCRIPTION"], as_index=False)["YIELD"].sum()
-    fig = px.bar(df, x="SIM_ELAPSED_STEPS", y="YIELD", color="MATERIAL_DESCRIPTION",
-                 color_discrete_sequence=COLORS, barmode="stack",
-                 labels={"SIM_ELAPSED_STEPS":"Step","YIELD":"Units Produced"})
-    return fig
+def prod_order_table(order_df):
+    if order_df.empty:
+        return html.P("None", className="text-muted", style={"padding":"10px"})
+    rows = []
+    for _, r in order_df.iterrows():
+        status_color = STATUS_COLORS.get(r["STATUS"], "#8b90a0")
+        rows.append(html.Tr([
+            html.Td(r["PRODUCTION_ORDER"],          style={"color":"#8b90a0","fontSize":"0.8rem","padding":"6px 8px"}),
+            html.Td(r["MATERIAL_DESCRIPTION"],      style={"color":"#c8cdd8","padding":"6px 8px","fontWeight":"500"}),
+            html.Td(f"{int(r['TARGET_QUANTITY']):,}", style={"color":ACCENT,"textAlign":"right","padding":"6px 8px"}),
+            html.Td(r["BEGIN_LABEL"],               style={"color":"#8b90a0","textAlign":"center","padding":"6px 8px"}),
+            html.Td(r["END_LABEL"],                 style={"color":"#8b90a0","textAlign":"center","padding":"6px 8px"}),
+            html.Td(f"{int(r['SETUP_TIME'])}",       style={"color":YELLOW if r['SETUP_TIME']>0 else "#8b90a0","textAlign":"center","padding":"6px 8px"}),
+            html.Td(r["STATUS"],                    style={"color":status_color,"fontWeight":"600","padding":"6px 8px"}),
+        ]))
+    header = html.Tr([
+        html.Th(h, style={"color":"#8b90a0","fontSize":"0.72rem","textTransform":"uppercase",
+                           "padding":"6px 8px","borderBottom":"1px solid #2a2d3e","textAlign":a})
+        for h, a in [("Order","left"),("Product","left"),("Qty","right"),
+                     ("Start","center"),("End","center"),("Setup","center"),("Status","left")]
+    ])
+    return html.Table([html.Thead(header), html.Tbody(rows)],
+                      style={"width":"100%","borderCollapse":"collapse"})
 
-# ── Layout ────────────────────────────────────────────────────────────────────
-app = dash.Dash(__name__, external_stylesheets=[dbc.themes.CYBORG],
-                title="ERPsim Dashboard · Team AA")
-
-val_color = GREEN if latest_val["COMPANY_VALUATION"] >= 0 else RED
-
-app.layout = dbc.Container(fluid=True, style={"backgroundColor": BG, "minHeight":"100vh", "padding":"20px"}, children=[
-
-    dcc.Interval(id="refresh", interval=REFRESH_S * 1000, n_intervals=0),
-
-    # ── Header ──────────────────────────────────────────────────────────────
-    dbc.Row(className="mb-3", children=[
-        dbc.Col([
-            html.H2("ERPsim Dashboard", style={"color":"#fff","fontWeight":"700","marginBottom":"2px"}),
-            html.Small(f"Team AA · SAP Client 435 · UWM", className="text-muted"),
-        ], width=8),
-        dbc.Col([
-            html.Div([
-                html.Span("● LIVE", style={"color":GREEN,"fontWeight":"600","marginRight":"8px"}),
-                html.Span(f"Step {int(latest_val['SIM_ELAPSED_STEPS'])}  |  Round {latest_val.get('SIM_ROUND','01')}  |  {latest_val.get('SIM_DATE','')}",
-                          style={"color":"#8b90a0"}),
-            ], className="text-end mt-2"),
-        ], width=4),
-    ]),
-
-    # ── KPI Cards ────────────────────────────────────────────────────────────
-    dbc.Row(className="mb-3 g-3", children=[
+# ── "Make" helpers for callback-updatable rows ─────────────────────────────────
+def make_top_kpi_row(latest_val, total_revenue, total_margin):
+    val_color = GREEN if latest_val["COMPANY_VALUATION"] >= 0 else RED
+    return [
         dbc.Col(kpi_card("Company Valuation",
                          f"€{latest_val['COMPANY_VALUATION']:,.0f}",
                          f"Risk Rate: {latest_val['COMPANY_RISK_RATE_PCT']}%",
@@ -573,138 +609,276 @@ app.layout = dbc.Container(fluid=True, style={"backgroundColor": BG, "minHeight"
                          str(latest_val.get("CREDIT_RATING","—")),
                          f"Market Risk: {latest_val['MARKET_RISK_RATE_PCT']}%",
                          GREEN if "A" in str(latest_val.get("CREDIT_RATING","")) else YELLOW), md=3),
+    ]
+
+def make_header_info(latest_val):
+    return [
+        html.Span("● LIVE", style={"color":GREEN,"fontWeight":"600","marginRight":"8px"}),
+        html.Span(f"Step {int(latest_val['SIM_ELAPSED_STEPS'])}  |  Round {latest_val.get('SIM_ROUND','01')}  |  {latest_val.get('SIM_DATE','')}",
+                  style={"color":"#8b90a0"}),
+    ]
+
+def make_prod_kpi_row(total_to_produce, pending_orders, in_progress_orders, up_next_orders, total_produced, avg_yield_step):
+    return [
+        dbc.Col(kpi_card(
+            "Total To Be Produced",
+            f"{total_to_produce:,} units",
+            f"{'⚠ Below 120k threshold!' if total_to_produce <= PROD_WARN_THRESHOLD else f'{len(pending_orders)} orders queued'}",
+            RED if total_to_produce <= PROD_WARN_THRESHOLD else (YELLOW if total_to_produce <= PROD_WARN_THRESHOLD*2 else GREEN),
+        ), md=3),
+        dbc.Col(kpi_card(
+            "Currently In Production",
+            f"{len(in_progress_orders)} order(s)",
+            in_progress_orders.iloc[0]["MATERIAL_DESCRIPTION"] if not in_progress_orders.empty else "Machine is idle",
+            YELLOW if not in_progress_orders.empty else "#8b90a0",
+        ), md=3),
+        dbc.Col(kpi_card(
+            "Total Produced (All Time)",
+            f"{total_produced:,.0f} units",
+            f"Avg {avg_yield_step:,.0f} units/step",
+            GREEN,
+        ), md=3),
+        dbc.Col(kpi_card(
+            "Orders Remaining",
+            f"{len(pending_orders)}",
+            f"Next: {up_next_orders.iloc[0]['MATERIAL_DESCRIPTION'] if not up_next_orders.empty else '—'}",
+            ACCENT,
+        ), md=3),
+    ]
+
+def make_sustain_kpi_row(carbon, total_co2):
+    last_co2 = (carbon[carbon['SIM_ELAPSED_STEPS']==carbon['SIM_ELAPSED_STEPS'].max()]['CO2E_EMISSIONS'].sum()
+                if (not carbon.empty and 'SIM_ELAPSED_STEPS' in carbon.columns) else 0)
+    return [
+        dbc.Col(kpi_card("Total CO₂e Emissions", f"{total_co2:,.0f} kg", "All scopes combined", "#e67e22"), md=6),
+        dbc.Col(kpi_card("Emissions This Period", f"{last_co2:,.0f} kg", "Latest step", "#e67e22"), md=6),
+    ]
+
+# ── App ────────────────────────────────────────────────────────────────────────
+app = dash.Dash(__name__, external_stylesheets=[dbc.themes.CYBORG],
+                title="ERPsim Dashboard · Team AA")
+
+app.layout = dbc.Container(fluid=True,
+    style={"backgroundColor": BG, "minHeight":"100vh", "padding":"20px"}, children=[
+
+    dcc.Interval(id="refresh", interval=REFRESH_S * 1000, n_intervals=0),
+
+    # Header
+    dbc.Row(className="mb-3", children=[
+        dbc.Col([
+            html.H2("ERPsim Dashboard",
+                    style={"color":"#fff","fontWeight":"700","marginBottom":"2px"}),
+            html.Small("Team AA · SAP Client 435 · UWM", className="text-muted"),
+        ], width=8),
+        dbc.Col([
+            html.Div(id="header-info", children=make_header_info(latest_val),
+                     className="text-end mt-2"),
+        ], width=4),
     ]),
 
-    # ── Tabs ─────────────────────────────────────────────────────────────────
+    # Top KPI row
+    dbc.Row(id="top-kpi-row", className="mb-3 g-3",
+            children=make_top_kpi_row(latest_val, total_revenue, total_margin)),
+
+    # Tabs
     dbc.Tabs(style={"borderBottom":"1px solid #2a2d3e"}, children=[
 
-        # ── Tab 1: Overview ─────────────────────────────────────────────────
+        # Overview
         dbc.Tab(label="Overview", tab_style={"color":"#8b90a0"}, active_tab_style={"color":"#fff"}, children=[
             dbc.Row(className="mt-3 g-3", children=[
-                dbc.Col(chart_card("Company Valuation & Profit Over Time", fig_valuation_over_time()), md=8),
-                dbc.Col(chart_card("Cash vs Bank Loan", fig_cash_and_debt()), md=4),
+                dbc.Col(chart_card("Company Valuation & Profit Over Time", "g-valuation",
+                                   fig_valuation_over_time(valuation)), md=8),
+                dbc.Col(chart_card("Cash vs Bank Loan", "g-cash",
+                                   fig_cash_and_debt(valuation)), md=4),
             ]),
             dbc.Row(className="mt-3 g-3", children=[
-                dbc.Col(chart_card("Revenue & Margin Per Step", fig_sales_by_period()), md=8),
-                dbc.Col(chart_card("Production Output Per Step", fig_production_over_time()), md=4),
+                dbc.Col(chart_card("Revenue & Margin Per Step", "g-sales-period",
+                                   fig_sales_by_period(sales)), md=8),
+                dbc.Col(chart_card("Production Output Per Step", "g-prod-time",
+                                   fig_production_over_time(prod)), md=4),
             ]),
         ]),
 
-        # ── Tab 2: Sales ─────────────────────────────────────────────────────
+        # Sales
         dbc.Tab(label="Sales", tab_style={"color":"#8b90a0"}, active_tab_style={"color":"#fff"}, children=[
             dbc.Row(className="mt-3 g-3", children=[
-                dbc.Col(chart_card("Revenue by Product", fig_revenue_by_product()), md=6),
-                dbc.Col(chart_card("Sales Split by Region", fig_sales_by_region()), md=3),
-                dbc.Col(chart_card("Wholesale vs Retail", fig_channel_split()), md=3),
+                dbc.Col(chart_card("Revenue by Product", "g-revenue-product",
+                                   fig_revenue_by_product(sales)), md=6),
+                dbc.Col(chart_card("Sales Split by Region", "g-sales-region",
+                                   fig_sales_by_region(sales)), md=3),
+                dbc.Col(chart_card("Wholesale vs Retail", "g-channel",
+                                   fig_channel_split(sales)), md=3),
             ]),
         ]),
 
-        # ── Tab 3: Inventory ──────────────────────────────────────────────────
+        # Inventory
         dbc.Tab(label="Inventory", tab_style={"color":"#8b90a0"}, active_tab_style={"color":"#fff"}, children=[
+            # Warehouse Capacity
+            dbc.Row(className="mt-3 mb-1", children=[
+                dbc.Col(html.H6("Warehouse Capacity",
+                                style={"color":"#8b90a0","textTransform":"uppercase",
+                                       "letterSpacing":"0.08em","fontSize":"0.75rem"}))
+            ]),
+            dbc.Row(id="capacity-row", className="g-3",
+                    children=make_capacity_section(inv_hist)),
             dbc.Row(className="mt-3 g-3", children=[
-                dbc.Col(chart_card("Current Stock by Product & Region", fig_inventory_kpi()), md=7),
-                dbc.Col(chart_card("Days of Stock Available (avg steps)", fig_days_available()), md=5),
+                dbc.Col(chart_card("Warehouse Levels Over Time", "g-inv-hist",
+                                   fig_inventory_history_by_type(inv_hist)), md=12),
+            ]),
+            dbc.Row(className="mt-3 g-3", children=[
+                dbc.Col(chart_card("Current Stock by Product & Region", "g-inv-kpi",
+                                   fig_inventory_kpi(inv_kpi)), md=7),
+                dbc.Col(chart_card("Days of Stock Available (avg steps)", "g-days-avail",
+                                   fig_days_available(inv_kpi)), md=5),
             ]),
         ]),
 
-        # ── Tab 4: Production ────────────────────────────────────────────────
+        # Production
         dbc.Tab(label="Production", tab_style={"color":"#8b90a0"}, active_tab_style={"color":"#fff"}, children=[
-
-            # KPI row
+            dbc.Row(id="prod-kpi-row", className="mt-3 g-3",
+                    children=make_prod_kpi_row(total_to_produce, pending_orders,
+                                               in_progress_orders, up_next_orders,
+                                               total_produced, avg_yield_step)),
             dbc.Row(className="mt-3 g-3", children=[
-                dbc.Col(kpi_card(
-                    "Total To Be Produced",
-                    f"{total_to_produce:,} units",
-                    f"{'⚠ Below 120k threshold!' if total_to_produce <= PROD_WARN_THRESHOLD else f'{len(pending_orders)} orders queued'}",
-                    RED if total_to_produce <= PROD_WARN_THRESHOLD else (YELLOW if total_to_produce <= PROD_WARN_THRESHOLD*2 else GREEN),
-                ), md=3),
-                dbc.Col(kpi_card(
-                    "Currently In Production",
-                    str(len(in_progress_orders)) + " order(s)",
-                    in_progress_orders.iloc[0]["MATERIAL_DESCRIPTION"] if not in_progress_orders.empty else "Machine is idle",
-                    YELLOW if not in_progress_orders.empty else "#8b90a0",
-                ), md=3),
-                dbc.Col(kpi_card(
-                    "Total Produced (All Time)",
-                    f"{total_produced:,.0f} units",
-                    f"Avg {avg_yield_step:,.0f} units/step",
-                    GREEN,
-                ), md=3),
-                dbc.Col(kpi_card(
-                    "Orders Remaining",
-                    f"{len(pending_orders)}",
-                    f"Next: {up_next_orders.iloc[0]['MATERIAL_DESCRIPTION'] if not up_next_orders.empty else '—'}",
-                    ACCENT,
-                ), md=3),
+                dbc.Col(dbc.Card([
+                    dbc.CardBody(id="div-current-prod",
+                                 children=current_in_production_card(in_progress_orders)[0])
+                ], id="card-current-prod",
+                   style={"background": CARD_BG,
+                          "border": f"1px solid {current_in_production_card(in_progress_orders)[1]}",
+                          "borderRadius":"10px", "height":"100%"}), md=6),
+                dbc.Col(dbc.Card([
+                    dbc.CardBody(id="div-up-next",
+                                 children=up_next_card(up_next_orders, current_elapsed))
+                ], style={"background": CARD_BG, "border": f"1px solid {ACCENT}",
+                          "borderRadius":"10px", "height":"100%"}), md=6),
             ]),
-
-            # Current in production + Up Next cards
             dbc.Row(className="mt-3 g-3", children=[
-                dbc.Col(current_in_production_card(), md=6),
-                dbc.Col(up_next_card(), md=6),
+                dbc.Col(chart_card("Production Schedule (Gantt)", "g-prod-gantt",
+                                   fig_prod_gantt(prod_orders, current_elapsed)), md=12),
             ]),
-
-            # Gantt chart
-            dbc.Row(className="mt-3 g-3", children=[
-                dbc.Col(chart_card("Production Schedule (Gantt)", fig_prod_gantt()), md=12),
-            ]),
-
-            # Queue table
             dbc.Row(className="mt-3 g-3", children=[
                 dbc.Col(dbc.Card([
                     dbc.CardBody([
                         html.H6("Full Production Queue",
                                 style={"color":"#8b90a0","textTransform":"uppercase",
                                        "letterSpacing":"0.08em","fontSize":"0.75rem","marginBottom":"12px"}),
-                        prod_order_table(prod_orders),
+                        html.Div(id="div-prod-queue", children=prod_order_table(prod_orders)),
                     ])
                 ], style={"background": CARD_BG, "border":"1px solid #2a2d3e", "borderRadius":"10px"}), md=8),
-                dbc.Col(chart_card("Setup Time Per Order (Steps Lost)", fig_setup_time()), md=4),
+                dbc.Col(chart_card("Setup Time Per Order (Steps Lost)", "g-setup-time",
+                                   fig_setup_time(prod_orders)), md=4),
             ]),
-
-            # Bottom charts
             dbc.Row(className="mt-3 g-3", children=[
-                dbc.Col(chart_card("Planned Qty Per Product (120k Warning)", fig_to_be_produced_by_product()), md=5),
-                dbc.Col(chart_card("Actual Yield Per Step", fig_yield_over_time_detail()), md=4),
-                dbc.Col(chart_card("Total Units Produced by Product", fig_actual_yield_by_product()), md=3),
+                dbc.Col(chart_card("Planned Qty Per Product (120k Warning)", "g-to-produce",
+                                   fig_to_be_produced_by_product(pending_orders)), md=5),
+                dbc.Col(chart_card("Actual Yield Per Step", "g-yield-time",
+                                   fig_yield_over_time_detail(prod)), md=4),
+                dbc.Col(chart_card("Total Units Produced by Product", "g-yield-product",
+                                   fig_actual_yield_by_product(prod)), md=3),
             ]),
         ]),
 
-        # ── Tab 6: Market ──────────────────────────────────────────────────
+        # Market
         dbc.Tab(label="Market", tab_style={"color":"#8b90a0"}, active_tab_style={"color":"#fff"}, children=[
             dbc.Row(className="mt-3 g-3", children=[
-                dbc.Col(chart_card("Market Share % by Product Over Periods", fig_market_share()), md=12),
+                dbc.Col(chart_card("Market Share % by Product Over Periods", "g-market-share",
+                                   fig_market_share(sales, market)), md=12),
             ]),
         ]),
 
-        # ── Tab 5: Sustainability ─────────────────────────────────────────
+        # Sustainability
         dbc.Tab(label="Sustainability", tab_style={"color":"#8b90a0"}, active_tab_style={"color":"#fff"}, children=[
             dbc.Row(className="mt-3 g-3", children=[
                 dbc.Col([
-                    dbc.Row(className="g-3 mb-3", children=[
-                        dbc.Col(kpi_card("Total CO₂e Emissions",
-                                         f"{total_co2:,.0f} kg",
-                                         "All scopes combined", "#e67e22"), md=6),
-                        dbc.Col(kpi_card("Emissions This Period",
-                                         f"{carbon[carbon['SIM_ELAPSED_STEPS']==carbon['SIM_ELAPSED_STEPS'].max()]['CO2E_EMISSIONS'].sum():,.0f} kg" if (not carbon.empty and 'SIM_ELAPSED_STEPS' in carbon.columns) else '0 kg',
-                                         "Latest step", "#e67e22"), md=6),
-                    ]),
-                    chart_card("CO₂e Over Time (step + cumulative)", fig_carbon_over_time()),
+                    dbc.Row(id="sustain-kpi-row", className="g-3 mb-3",
+                            children=make_sustain_kpi_row(carbon, total_co2)),
+                    chart_card("CO₂e Over Time (step + cumulative)", "g-carbon-time",
+                               fig_carbon_over_time(carbon)),
                 ], md=6),
-                dbc.Col(chart_card("Emissions by Type", fig_carbon_by_type()), md=6),
+                dbc.Col(chart_card("Emissions by Type", "g-carbon-type",
+                                   fig_carbon_by_type(carbon)), md=6),
             ]),
         ]),
-
     ]),
 
-    # Footer
     html.Hr(style={"borderColor":"#2a2d3e","marginTop":"30px"}),
     html.P(f"Auto-refreshes every {REFRESH_S}s  ·  Data: SAP NetWeaver OData · Client 435",
            className="text-center text-muted", style={"fontSize":"0.75rem"}),
 ])
 
-# ── Callback: live refresh ────────────────────────────────────────────────────
-# (Full page reload via browser refresh; for true live update extend callbacks)
+# ── Live refresh callback ──────────────────────────────────────────────────────
+@callback(
+    # Graphs
+    Output("g-valuation",      "figure"),
+    Output("g-cash",           "figure"),
+    Output("g-sales-period",   "figure"),
+    Output("g-prod-time",      "figure"),
+    Output("g-revenue-product","figure"),
+    Output("g-sales-region",   "figure"),
+    Output("g-channel",        "figure"),
+    Output("g-inv-kpi",        "figure"),
+    Output("g-days-avail",     "figure"),
+    Output("g-prod-gantt",     "figure"),
+    Output("g-setup-time",     "figure"),
+    Output("g-to-produce",     "figure"),
+    Output("g-yield-time",     "figure"),
+    Output("g-yield-product",  "figure"),
+    Output("g-market-share",   "figure"),
+    Output("g-carbon-type",    "figure"),
+    Output("g-carbon-time",    "figure"),
+    Output("g-inv-hist",       "figure"),
+    # KPI rows
+    Output("header-info",      "children"),
+    Output("top-kpi-row",      "children"),
+    Output("prod-kpi-row",     "children"),
+    Output("sustain-kpi-row",  "children"),
+    # Production detail
+    Output("div-current-prod", "children"),
+    Output("div-up-next",      "children"),
+    Output("div-prod-queue",   "children"),
+    Output("capacity-row",     "children"),
+    Input("refresh", "n_intervals"),
+)
+def refresh_all(n):
+    # Reload all data from OData
+    s, v, ik, mkt, c, p, po, ih = load_all()
+    (lv, tr, tm, tco2, ce, tp, ays,
+     ip_orders, un_orders, pend, ttp, po) = compute_derived(s, v, ik, c, p, po)
+
+    card_body, border_color = current_in_production_card(ip_orders)
+
+    def sf(fig):
+        return style_fig(fig)
+
+    return (
+        sf(fig_valuation_over_time(v)),
+        sf(fig_cash_and_debt(v)),
+        sf(fig_sales_by_period(s)),
+        sf(fig_production_over_time(p)),
+        sf(fig_revenue_by_product(s)),
+        sf(fig_sales_by_region(s)),
+        sf(fig_channel_split(s)),
+        sf(fig_inventory_kpi(ik)),
+        sf(fig_days_available(ik)),
+        sf(fig_prod_gantt(po, ce)),
+        sf(fig_setup_time(po)),
+        sf(fig_to_be_produced_by_product(pend)),
+        sf(fig_yield_over_time_detail(p)),
+        sf(fig_actual_yield_by_product(p)),
+        sf(fig_market_share(s, mkt)),
+        sf(fig_carbon_by_type(c)),
+        sf(fig_carbon_over_time(c)),
+        sf(fig_inventory_history_by_type(ih)),
+        make_header_info(lv),
+        make_top_kpi_row(lv, tr, tm),
+        make_prod_kpi_row(ttp, pend, ip_orders, un_orders, tp, ays),
+        make_sustain_kpi_row(c, tco2),
+        card_body,
+        up_next_card(un_orders, ce),
+        prod_order_table(po),
+        make_capacity_section(ih),
+    )
 
 if __name__ == "__main__":
     app.run(debug=False, port=8050)
