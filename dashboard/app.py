@@ -78,6 +78,7 @@ def load_all():
     prod        = fetch("Production")
     prod_orders = fetch("Production_Orders")
     inv_hist    = fetch("Inventory")
+    pricing     = fetch("Current_Pricing_Conditions")
 
     sales       = to_num(sales,       ["QUANTITY","QUANTITY_DELIVERED","NET_PRICE","NET_VALUE","COST","SIM_ELAPSED_STEPS","SIM_PERIOD"])
     valuation   = to_num(valuation,   ["BANK_CASH_ACCOUNT","ACCOUNTS_RECEIVABLE","BANK_LOAN",
@@ -127,7 +128,9 @@ def load_all():
     else:
         inv_hist["MAT_TYPE"] = pd.Series(dtype=str)
 
-    return sales, valuation, inv_kpi, market, carbon, prod, prod_orders, inv_hist
+    pricing = to_num(pricing, ["PRICE"])
+
+    return sales, valuation, inv_kpi, market, carbon, prod, prod_orders, inv_hist, pricing
 
 def compute_derived(sales, valuation, inv_kpi, carbon, prod, prod_orders):
     latest_val     = valuation.sort_values("SIM_ELAPSED_STEPS").iloc[-1] if not valuation.empty else pd.Series(_VAL_EMPTY)
@@ -167,7 +170,7 @@ def compute_derived(sales, valuation, inv_kpi, carbon, prod, prod_orders):
             in_progress, up_next, pending, total_to_produce, prod_orders)
 
 # ── Initial load ───────────────────────────────────────────────────────────────
-sales, valuation, inv_kpi, market, carbon, prod, prod_orders, inv_hist = load_all()
+sales, valuation, inv_kpi, market, carbon, prod, prod_orders, inv_hist, pricing = load_all()
 (latest_val, total_revenue, total_margin, total_co2,
  current_elapsed, total_produced, avg_yield_step,
  in_progress_orders, up_next_orders, pending_orders, total_to_produce,
@@ -377,6 +380,97 @@ def fig_inventory_history_by_type(inv_hist):
                       annotation_font_color=type_colors.get(mat_type, "#8b90a0"),
                       annotation_position="right")
     fig.update_layout(hovermode="x unified", yaxis_title="Units in Stock")
+    return fig
+
+@safe
+def fig_price_heatmap(pricing, market):
+    """Heatmap: our price vs market average. Red=too low, Green=close, Orange=too high."""
+    # Get latest period market averages by product + channel
+    mkt = to_num(market.copy(), ["AVERAGE_PRICE", "SIM_PERIOD"])
+    latest_period = mkt["SIM_PERIOD"].max()
+    mkt_avg = (mkt[mkt["SIM_PERIOD"] == latest_period]
+               .groupby(["MATERIAL_DESCRIPTION","DISTRIBUTION_CHANNEL"], as_index=False)
+               ["AVERAGE_PRICE"].mean())
+
+    # Our prices with channel code
+    our = pricing.copy()
+    our = to_num(our, ["PRICE"])
+
+    # Merge on product + channel code
+    merged = our.merge(mkt_avg, on=["MATERIAL_DESCRIPTION","DISTRIBUTION_CHANNEL"], how="inner")
+    if merged.empty:
+        return empty_fig("No market comparison data yet")
+
+    # % diff: positive = our price higher than market, negative = lower
+    merged["PCT_DIFF"] = ((merged["PRICE"] - merged["AVERAGE_PRICE"]) / merged["AVERAGE_PRICE"] * 100).round(1)
+    merged["LABEL"] = merged.apply(
+        lambda r: f"Us: €{r['PRICE']:.2f}<br>Mkt: €{r['AVERAGE_PRICE']:.2f}<br>{r['PCT_DIFF']:+.1f}%", axis=1)
+
+    # Pivot for heatmap
+    z_df   = merged.pivot(index="MATERIAL_DESCRIPTION", columns="DC_NAME", values="PCT_DIFF")
+    txt_df = merged.pivot(index="MATERIAL_DESCRIPTION", columns="DC_NAME", values="LABEL")
+
+    # Colorscale: red (low) → green (close) → orange (high)
+    # Clamp to ±20% range; 0% → green
+    CLAMP = 20
+    colorscale = [
+        [0.0,  "#e74c3c"],   # -20% or lower: red
+        [0.5,  "#2ecc71"],   # 0%: green
+        [1.0,  "#f39c12"],   # +20% or higher: orange
+    ]
+
+    fig = go.Figure(go.Heatmap(
+        z=z_df.values,
+        x=z_df.columns.tolist(),
+        y=z_df.index.tolist(),
+        text=txt_df.values,
+        hovertemplate="%{y}<br>%{x}<br>%{text}<extra></extra>",
+        texttemplate="%{z:+.1f}%",
+        colorscale=colorscale,
+        zmin=-CLAMP, zmid=0, zmax=CLAMP,
+        colorbar=dict(
+            title=dict(text="% vs Market", font=dict(color="#c8cdd8")),
+            tickvals=[-20, -10, 0, 10, 20],
+            ticktext=["-20% (Low)", "-10%", "At Market", "+10%", "+20% (High)"],
+            tickfont=dict(color="#c8cdd8"),
+        ),
+    ))
+    fig.update_layout(
+        xaxis_title="Distribution Channel",
+        yaxis_title="",
+        height=480,
+        xaxis=dict(side="top"),
+    )
+    return fig
+
+@safe
+def fig_price_vs_market_bar(pricing, market):
+    """Bar chart comparing our price vs market avg per product for latest period."""
+    mkt = to_num(market.copy(), ["AVERAGE_PRICE", "SIM_PERIOD"])
+    latest_period = mkt["SIM_PERIOD"].max()
+    mkt_avg = (mkt[mkt["SIM_PERIOD"] == latest_period]
+               .groupby(["MATERIAL_DESCRIPTION","DISTRIBUTION_CHANNEL"], as_index=False)
+               ["AVERAGE_PRICE"].mean())
+
+    our = to_num(pricing.copy(), ["PRICE"])
+    merged = our.merge(mkt_avg, on=["MATERIAL_DESCRIPTION","DISTRIBUTION_CHANNEL"], how="inner")
+    if merged.empty:
+        return empty_fig("No market comparison data yet")
+
+    merged["PCT_DIFF"] = ((merged["PRICE"] - merged["AVERAGE_PRICE"]) / merged["AVERAGE_PRICE"] * 100).round(1)
+    merged = merged.sort_values(["DC_NAME","MATERIAL_DESCRIPTION"])
+    bar_colors = [RED if v < -5 else (YELLOW if v > 10 else GREEN) for v in merged["PCT_DIFF"]]
+
+    fig = go.Figure()
+    fig.add_bar(name="Our Price", x=merged["MATERIAL_DESCRIPTION"],
+                y=merged["PRICE"], marker_color=bar_colors,
+                text=merged["DC_NAME"], hovertemplate="%{x}<br>%{text}<br>Our: €%{y:.2f}<extra></extra>")
+    fig.add_trace(go.Scatter(name="Market Avg", x=merged["MATERIAL_DESCRIPTION"],
+                             y=merged["AVERAGE_PRICE"], mode="markers",
+                             marker=dict(color="#fff", size=8, symbol="diamond"),
+                             hovertemplate="%{x}<br>Market Avg: €%{y:.2f}<extra></extra>"))
+    fig.update_layout(hovermode="x unified", xaxis_tickangle=-35,
+                      yaxis_title="Price (EUR)", barmode="group")
     return fig
 
 @safe
@@ -779,6 +873,18 @@ app.layout = dbc.Container(fluid=True,
             ]),
         ]),
 
+        # Pricing
+        dbc.Tab(label="Pricing", tab_style={"color":"#8b90a0"}, active_tab_style={"color":"#fff"}, children=[
+            dbc.Row(className="mt-3 g-3", children=[
+                dbc.Col(chart_card("Our Price vs Market Average — Heatmap", "g-price-heatmap",
+                                   fig_price_heatmap(pricing, market)), md=12),
+            ]),
+            dbc.Row(className="mt-3 g-3", children=[
+                dbc.Col(chart_card("Our Price vs Market Average — By Product", "g-price-bar",
+                                   fig_price_vs_market_bar(pricing, market)), md=12),
+            ]),
+        ]),
+
         # Market
         dbc.Tab(label="Market", tab_style={"color":"#8b90a0"}, active_tab_style={"color":"#fff"}, children=[
             dbc.Row(className="mt-3 g-3", children=[
@@ -824,6 +930,8 @@ app.layout = dbc.Container(fluid=True,
     Output("g-to-produce",     "figure"),
     Output("g-yield-time",     "figure"),
     Output("g-yield-product",  "figure"),
+    Output("g-price-heatmap",  "figure"),
+    Output("g-price-bar",      "figure"),
     Output("g-market-share",   "figure"),
     Output("g-carbon-type",    "figure"),
     Output("g-carbon-time",    "figure"),
@@ -842,7 +950,7 @@ app.layout = dbc.Container(fluid=True,
 )
 def refresh_all(n):
     # Reload all data from OData
-    s, v, ik, mkt, c, p, po, ih = load_all()
+    s, v, ik, mkt, c, p, po, ih, pr = load_all()
     (lv, tr, tm, tco2, ce, tp, ays,
      ip_orders, un_orders, pend, ttp, po) = compute_derived(s, v, ik, c, p, po)
 
@@ -866,6 +974,8 @@ def refresh_all(n):
         sf(fig_to_be_produced_by_product(pend)),
         sf(fig_yield_over_time_detail(p)),
         sf(fig_actual_yield_by_product(p)),
+        sf(fig_price_heatmap(pr, mkt)),
+        sf(fig_price_vs_market_bar(pr, mkt)),
         sf(fig_market_share(s, mkt)),
         sf(fig_carbon_by_type(c)),
         sf(fig_carbon_over_time(c)),
