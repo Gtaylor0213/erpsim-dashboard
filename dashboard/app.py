@@ -1,4 +1,6 @@
 import os
+import json
+import anthropic
 import requests
 import pandas as pd
 import plotly.express as px
@@ -8,8 +10,9 @@ from dash import dcc, html, Input, Output, State, callback, no_update
 import dash_bootstrap_components as dbc
 
 # ── Config ────────────────────────────────────────────────────────────────────
-BASE_URL  = "http://uno.ucc.uwm.edu/odata/435"
-REFRESH_S = 20
+BASE_URL      = "http://uno.ucc.uwm.edu/odata/435"
+REFRESH_S     = 20
+ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
 CHANNEL_MAP = {"12": "Wholesale", "14": "Retail"}
 LOC_MAP     = {"02": "Central", "02N": "North", "02S": "South", "02W": "West"}
@@ -798,6 +801,86 @@ def make_notifications(pur_orders, ip_orders, inv_kpi):
         )]
     return badges
 
+def make_data_snapshot(lv, tr, tm, ik, ip_orders, pr, mkt):
+    """Build a compact JSON-serialisable summary of current game state for AI context."""
+    snap = {
+        "step":      int(lv.get("SIM_ELAPSED_STEPS", 0)),
+        "round":     str(lv.get("SIM_ROUND", "?")),
+        "date":      str(lv.get("SIM_DATE", "")),
+        "cash":      float(lv.get("BANK_CASH_ACCOUNT", 0)),
+        "loan":      float(lv.get("BANK_LOAN", 0)),
+        "valuation": float(lv.get("COMPANY_VALUATION", 0)),
+        "profit":    float(lv.get("PROFIT", 0)),
+        "revenue":   float(tr),
+        "margin":    float(tm),
+        "credit":    str(lv.get("CREDIT_RATING", "—")),
+        "inventory": [],
+        "pricing":   [],
+        "in_production": None,
+        "pending_po": [],
+    }
+    # Inventory
+    if not ik.empty and "MATERIAL_DESCRIPTION" in ik.columns:
+        grp = ik.groupby(["MATERIAL_NUMBER","MATERIAL_DESCRIPTION"], as_index=False).agg(
+            stock=("CURRENT_INVENTORY","sum"), days=("NB_STEPS_AVAILABLE","mean"))
+        for _, r in grp.iterrows():
+            snap["inventory"].append({
+                "id": str(r["MATERIAL_NUMBER"]).strip(),
+                "name": r["MATERIAL_DESCRIPTION"],
+                "stock": int(r["stock"]),
+                "days": round(float(r["days"]), 1),
+            })
+    # Pricing vs market
+    if not pr.empty and not mkt.empty:
+        mkt2 = to_num(mkt.copy(), ["AVERAGE_PRICE","SIM_PERIOD"])
+        latest = mkt2["SIM_PERIOD"].max()
+        mkt_avg = (mkt2[mkt2["SIM_PERIOD"]==latest]
+                   .groupby(["MATERIAL_DESCRIPTION","DISTRIBUTION_CHANNEL"], as_index=False)
+                   ["AVERAGE_PRICE"].mean())
+        merged = to_num(pr.copy(), ["PRICE"]).merge(
+            mkt_avg, on=["MATERIAL_DESCRIPTION","DISTRIBUTION_CHANNEL"], how="inner")
+        for _, r in merged.iterrows():
+            pct = ((r["PRICE"] - r["AVERAGE_PRICE"]) / r["AVERAGE_PRICE"] * 100) if r["AVERAGE_PRICE"] else 0
+            snap["pricing"].append({
+                "product":   r["MATERIAL_DESCRIPTION"],
+                "channel":   r.get("DC_NAME", r["DISTRIBUTION_CHANNEL"]),
+                "our_price": round(float(r["PRICE"]), 2),
+                "mkt_price": round(float(r["AVERAGE_PRICE"]), 2),
+                "pct":       round(pct, 1),
+            })
+    # In-progress production
+    if not ip_orders.empty:
+        row = ip_orders.iloc[0]
+        snap["in_production"] = (f"{row['MATERIAL_DESCRIPTION']} — "
+                                 f"{int(row.get('TARGET_QUANTITY',0)):,} units, "
+                                 f"ends step {row.get('END_LABEL','?')}")
+    return snap
+
+
+def build_ai_context(snapshot):
+    """Turn snapshot dict into a readable context block for the system prompt."""
+    if not snapshot:
+        return "No live data available yet."
+    s = snapshot
+    lines = [
+        f"=== ERPsim Live Data — Step {s['step']}, Round {s['round']} ({s['date']}) ===",
+        f"Cash: €{s['cash']:,.0f}  |  Loan: €{s['loan']:,.0f}  |  Valuation: €{s['valuation']:,.0f}  |  Profit: €{s['profit']:,.0f}",
+        f"Total Revenue: €{s['revenue']:,.0f}  |  Margin: €{s['margin']:,.0f}  |  Credit: {s['credit']}",
+        "",
+        "INVENTORY (stock / steps of stock remaining):",
+    ]
+    for i in s.get("inventory", []):
+        warn = " ⚠ LOW" if i["days"] < 10 else ""
+        lines.append(f"  {i['id']} {i['name']}: {i['stock']:,} units, {i['days']} steps{warn}")
+    lines.append("")
+    lines.append("PRICING vs MARKET AVERAGE:")
+    for p in s.get("pricing", []):
+        arrow = "↓ too low" if p["pct"] < -5 else ("↑ high" if p["pct"] > 5 else "≈ at market")
+        lines.append(f"  {p['product']} [{p['channel']}]: €{p['our_price']:.2f} vs mkt €{p['mkt_price']:.2f} ({p['pct']:+.1f}% {arrow})")
+    if s.get("in_production"):
+        lines.append(f"\nIN PRODUCTION: {s['in_production']}")
+    return "\n".join(lines)
+
 def make_sustain_kpi_row(carbon, total_co2):
     last_co2 = (carbon[carbon['SIM_ELAPSED_STEPS']==carbon['SIM_ELAPSED_STEPS'].max()]['CO2E_EMISSIONS'].sum()
                 if (not carbon.empty and 'SIM_ELAPSED_STEPS' in carbon.columns) else 0)
@@ -846,9 +929,52 @@ _LOGIN_OVERLAY = html.Div(id="login-overlay", style={
 app.layout = dbc.Container(fluid=True,
     style={"backgroundColor": BG, "minHeight":"100vh", "padding":"20px"}, children=[
 
-    dcc.Store(id="auth-store", storage_type="session"),
+    dcc.Store(id="auth-store",     storage_type="session"),
+    dcc.Store(id="data-snapshot",  storage_type="memory"),
+    dcc.Store(id="chat-history",   storage_type="memory", data=[]),
     dcc.Interval(id="refresh", interval=REFRESH_S * 1000, n_intervals=0),
     _LOGIN_OVERLAY,
+
+    # ── Floating AI chat panel ──────────────────────────────────────────────────
+    html.Div(style={"position":"fixed","bottom":"24px","right":"24px","zIndex":4000}, children=[
+        # Toggle button
+        dbc.Button("✦ Ask AI", id="chat-toggle", color="primary", size="sm",
+                   style={"borderRadius":"20px","fontWeight":"600","boxShadow":"0 2px 12px rgba(79,142,247,0.4)"}),
+        # Chat window
+        html.Div(id="chat-window", style={"display":"none"}, children=[
+            dbc.Card(style={
+                "width":"380px","background":"#1a1d27","border":"1px solid #2a2d3e",
+                "borderRadius":"12px","marginBottom":"10px",
+                "boxShadow":"0 4px 24px rgba(0,0,0,0.5)",
+            }, children=[
+                # Header
+                dbc.CardHeader(html.Div([
+                    html.Span("✦ ERPsim AI Analyst", style={"color":"#fff","fontWeight":"600","fontSize":"0.9rem"}),
+                    dbc.Button("✕", id="chat-close", color="link", size="sm",
+                               style={"color":"#8b90a0","float":"right","padding":"0","lineHeight":"1"}),
+                ]), style={"background":"#1a1d27","border":"none","paddingBottom":"8px"}),
+                # Message history
+                html.Div(id="chat-messages", style={
+                    "height":"340px","overflowY":"auto","padding":"12px",
+                    "display":"flex","flexDirection":"column","gap":"8px",
+                }, children=[
+                    html.Div("Hi! I have your live ERPsim data. Ask me anything — pricing strategy, inventory risks, production decisions.",
+                             style={"background":"#2a2d3e","color":"#c8cdd8","borderRadius":"8px",
+                                    "padding":"10px 12px","fontSize":"0.83rem","maxWidth":"90%"}),
+                ]),
+                # Input row
+                dbc.CardFooter(html.Div([
+                    dbc.Input(id="chat-input", placeholder="Ask about your data...", type="text",
+                              debounce=False,
+                              style={"background":"#0f1117","color":"#fff","border":"1px solid #2a2d3e",
+                                     "borderRadius":"8px","fontSize":"0.83rem","flex":"1"}),
+                    dbc.Button("→", id="chat-send", color="primary", size="sm",
+                               style={"borderRadius":"8px","marginLeft":"6px","fontWeight":"700"}),
+                ], style={"display":"flex","alignItems":"center"}),
+                style={"background":"#1a1d27","border":"none","paddingTop":"8px"}),
+            ]),
+        ]),
+    ]),
 
     # Main dashboard (hidden until logged in)
     html.Div(id="main-content", style={"display":"none"}, children=[
@@ -1115,12 +1241,13 @@ def toggle_auth(auth_data):
     Output("div-prod-queue",   "children"),
     Output("capacity-row",        "children"),
     Output("notifications-bar",   "children"),
+    Output("data-snapshot",       "data"),
     Input("refresh", "n_intervals"),
     State("auth-store", "data"),
 )
 def refresh_all(n, auth_data):
     if not auth_data:
-        return tuple([no_update] * 29)
+        return tuple([no_update] * 30)
     auth     = (auth_data["username"], auth_data["password"])
     base_url = auth_data.get("base_url", BASE_URL)
     # Reload all data from OData
@@ -1163,7 +1290,90 @@ def refresh_all(n, auth_data):
         prod_order_table(po),
         make_capacity_section(ih),
         make_notifications(pur, ip_orders, ik),
+        make_data_snapshot(lv, tr, tm, ik, ip_orders, pr, mkt),
     )
+
+# ── Chat callbacks ─────────────────────────────────────────────────────────────
+@callback(
+    Output("chat-window", "style"),
+    Input("chat-toggle",  "n_clicks"),
+    Input("chat-close",   "n_clicks"),
+    State("chat-window",  "style"),
+    prevent_initial_call=True,
+)
+def toggle_chat(open_clicks, close_clicks, current_style):
+    from dash import ctx
+    if ctx.triggered_id == "chat-close":
+        return {"display": "none"}
+    visible = current_style and current_style.get("display") != "none"
+    return {"display": "none"} if visible else {"display": "block"}
+
+@callback(
+    Output("chat-messages", "children"),
+    Output("chat-history",  "data"),
+    Output("chat-input",    "value"),
+    Input("chat-send",      "n_clicks"),
+    State("chat-input",     "value"),
+    State("chat-history",   "data"),
+    State("data-snapshot",  "data"),
+    prevent_initial_call=True,
+)
+def send_message(n_clicks, user_text, history, snapshot):
+    if not user_text or not user_text.strip():
+        return no_update, no_update, no_update
+
+    if not ANTHROPIC_KEY:
+        err_bubble = html.Div("⚠ ANTHROPIC_API_KEY not set.",
+                              style={"background":"#e74c3c22","color":RED,"borderRadius":"8px",
+                                     "padding":"10px 12px","fontSize":"0.83rem","maxWidth":"90%",
+                                     "alignSelf":"flex-start"})
+        return [err_bubble], history, ""
+
+    history = history or []
+    history.append({"role": "user", "content": user_text.strip()})
+
+    system_prompt = (
+        "You are an expert ERPsim business analyst and coach. "
+        "ERPsim is a SAP business simulation where teams manage a muesli company — "
+        "buying raw materials, scheduling production, setting prices, and managing cash. "
+        "You have access to the team's live data below. Give concise, actionable advice. "
+        "Focus on what to do THIS step. Be direct — the simulation moves fast.\n\n"
+        + build_ai_context(snapshot)
+    )
+
+    try:
+        client = anthropic.Anthropic(api_key=ANTHROPIC_KEY)
+        response = client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=400,
+            system=system_prompt,
+            messages=history,
+        )
+        reply = response.content[0].text
+    except Exception as e:
+        reply = f"Error calling Claude API: {e}"
+
+    history.append({"role": "assistant", "content": reply})
+
+    # Rebuild message bubbles from full history
+    greeting = html.Div(
+        "Hi! I have your live ERPsim data. Ask me anything — pricing strategy, inventory risks, production decisions.",
+        style={"background":"#2a2d3e","color":"#c8cdd8","borderRadius":"8px",
+               "padding":"10px 12px","fontSize":"0.83rem","maxWidth":"90%","alignSelf":"flex-start"})
+    bubbles = [greeting]
+    for msg in history:
+        is_user = msg["role"] == "user"
+        bubbles.append(html.Div(msg["content"], style={
+            "background":   ACCENT + "33" if is_user else "#2a2d3e",
+            "color":        "#fff" if is_user else "#c8cdd8",
+            "borderRadius": "8px",
+            "padding":      "10px 12px",
+            "fontSize":     "0.83rem",
+            "maxWidth":     "85%",
+            "alignSelf":    "flex-end" if is_user else "flex-start",
+        }))
+
+    return bubbles, history, ""
 
 if __name__ == "__main__":
     app.run(debug=False, port=8050)

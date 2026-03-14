@@ -4,3 +4,4 @@ plotly>=5.22
 pandas>=2.0
 requests>=2.31
 gunicorn>=21.2
+anthropic>=0.84
