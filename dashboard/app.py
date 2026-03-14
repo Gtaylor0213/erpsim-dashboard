@@ -3,13 +3,11 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import dash
-from dash import dcc, html, Input, Output, callback
+from dash import dcc, html, Input, Output, State, callback, no_update
 import dash_bootstrap_components as dbc
 
 # ── Config ────────────────────────────────────────────────────────────────────
 BASE_URL  = "http://uno.ucc.uwm.edu/odata/435"
-AUTH      = ("A_1", "legoman99")
-COMPANY   = "AA"
 REFRESH_S = 20
 
 CHANNEL_MAP = {"12": "Wholesale", "14": "Retail"}
@@ -48,9 +46,9 @@ _VAL_EMPTY = {
 }
 
 # ── Data helpers ───────────────────────────────────────────────────────────────
-def fetch(entity):
+def fetch(entity, auth):
     url = f"{BASE_URL}/{entity}?$format=json"
-    resp = requests.get(url, auth=AUTH, timeout=30)
+    resp = requests.get(url, auth=auth, timeout=30)
     resp.raise_for_status()
     rows = resp.json()["d"]["results"]
     df = pd.DataFrame(rows)
@@ -69,16 +67,17 @@ def rs_to_elapsed(round_str, step_str):
     except Exception:
         return 0
 
-def load_all():
-    sales       = fetch("Sales")
-    valuation   = fetch("Company_Valuation")
-    inv_kpi     = fetch("Current_Inventory_KPI")
-    market      = fetch("Market")
-    carbon      = fetch("Carbon_Emissions")
-    prod        = fetch("Production")
-    prod_orders = fetch("Production_Orders")
-    inv_hist    = fetch("Inventory")
-    pricing     = fetch("Current_Pricing_Conditions")
+def load_all(auth):
+    sales       = fetch("Sales",                     auth)
+    valuation   = fetch("Company_Valuation",         auth)
+    inv_kpi     = fetch("Current_Inventory_KPI",     auth)
+    market      = fetch("Market",                    auth)
+    carbon      = fetch("Carbon_Emissions",          auth)
+    prod        = fetch("Production",                auth)
+    prod_orders = fetch("Production_Orders",         auth)
+    inv_hist    = fetch("Inventory",                 auth)
+    pricing     = fetch("Current_Pricing_Conditions",auth)
+    pur_orders  = fetch("Purchase_Orders",           auth)
 
     sales       = to_num(sales,       ["QUANTITY","QUANTITY_DELIVERED","NET_PRICE","NET_VALUE","COST","SIM_ELAPSED_STEPS","SIM_PERIOD"])
     valuation   = to_num(valuation,   ["BANK_CASH_ACCOUNT","ACCOUNTS_RECEIVABLE","BANK_LOAN",
@@ -129,8 +128,9 @@ def load_all():
         inv_hist["MAT_TYPE"] = pd.Series(dtype=str)
 
     pricing = to_num(pricing, ["PRICE"])
+    pur_orders = to_num(pur_orders, ["QUANTITY", "UNIT_PRICE", "SIM_ELAPSED_STEPS"])
 
-    return sales, valuation, inv_kpi, market, carbon, prod, prod_orders, inv_hist, pricing
+    return sales, valuation, inv_kpi, market, carbon, prod, prod_orders, inv_hist, pricing, pur_orders
 
 def compute_derived(sales, valuation, inv_kpi, carbon, prod, prod_orders):
     latest_val     = valuation.sort_values("SIM_ELAPSED_STEPS").iloc[-1] if not valuation.empty else pd.Series(_VAL_EMPTY)
@@ -170,11 +170,13 @@ def compute_derived(sales, valuation, inv_kpi, carbon, prod, prod_orders):
             in_progress, up_next, pending, total_to_produce, prod_orders)
 
 # ── Initial load ───────────────────────────────────────────────────────────────
-sales, valuation, inv_kpi, market, carbon, prod, prod_orders, inv_hist, pricing = load_all()
-(latest_val, total_revenue, total_margin, total_co2,
- current_elapsed, total_produced, avg_yield_step,
- in_progress_orders, up_next_orders, pending_orders, total_to_produce,
- prod_orders) = compute_derived(sales, valuation, inv_kpi, carbon, prod, prod_orders)
+_edf = pd.DataFrame()
+sales = valuation = inv_kpi = market = carbon = prod = prod_orders = inv_hist = pricing = pur_orders = _edf
+latest_val         = pd.Series(_VAL_EMPTY)
+total_revenue      = total_margin = total_co2 = 0
+total_produced     = avg_yield_step = current_elapsed = 0
+in_progress_orders = up_next_orders = pending_orders = pd.DataFrame()
+total_to_produce   = 0
 
 # ── UI helpers ─────────────────────────────────────────────────────────────────
 def empty_fig(msg="No data yet — waiting for simulation to start"):
@@ -309,21 +311,31 @@ def fig_channel_split(sales):
 
 @safe
 def fig_inventory_kpi(inv_kpi):
-    df = inv_kpi.groupby(["MATERIAL_DESCRIPTION","REGION"], as_index=False).agg(
+    df = inv_kpi.copy()
+    if "MATERIAL_NUMBER" in df.columns:
+        df["LABEL"] = df["MATERIAL_NUMBER"].str.strip() + " · " + df["MATERIAL_DESCRIPTION"]
+    else:
+        df["LABEL"] = df["MATERIAL_DESCRIPTION"]
+    df = df.groupby(["LABEL","REGION"], as_index=False).agg(
         Stock=("CURRENT_INVENTORY","sum"), DaysAvail=("NB_STEPS_AVAILABLE","mean"))
-    fig = px.bar(df, x="MATERIAL_DESCRIPTION", y="Stock", color="REGION",
+    fig = px.bar(df, x="LABEL", y="Stock", color="REGION",
                  color_discrete_sequence=COLORS, barmode="stack",
-                 labels={"MATERIAL_DESCRIPTION":"", "Stock":"Current Inventory (units)"})
+                 labels={"LABEL":"", "Stock":"Current Inventory (units)"})
     fig.update_xaxes(tickangle=-35)
     return fig
 
 @safe
 def fig_days_available(inv_kpi):
-    df = inv_kpi.groupby("MATERIAL_DESCRIPTION", as_index=False)["NB_STEPS_AVAILABLE"].mean()
+    df = inv_kpi.copy()
+    if "MATERIAL_NUMBER" in df.columns:
+        df["LABEL"] = df["MATERIAL_NUMBER"].str.strip() + " · " + df["MATERIAL_DESCRIPTION"]
+    else:
+        df["LABEL"] = df["MATERIAL_DESCRIPTION"]
+    df = df.groupby("LABEL", as_index=False)["NB_STEPS_AVAILABLE"].mean()
     df = df.sort_values("NB_STEPS_AVAILABLE")
     colors = [RED if v < 10 else (YELLOW if v < 20 else GREEN) for v in df["NB_STEPS_AVAILABLE"]]
-    fig = px.bar(df, x="NB_STEPS_AVAILABLE", y="MATERIAL_DESCRIPTION", orientation="h",
-                 labels={"NB_STEPS_AVAILABLE":"Avg Steps Stock Available", "MATERIAL_DESCRIPTION":""})
+    fig = px.bar(df, x="NB_STEPS_AVAILABLE", y="LABEL", orientation="h",
+                 labels={"NB_STEPS_AVAILABLE":"Avg Steps Stock Available", "LABEL":""})
     fig.update_traces(marker_color=colors)
     fig.add_vline(x=10, line_dash="dash", line_color=RED, annotation_text="Warning")
     return fig
@@ -740,6 +752,50 @@ def make_prod_kpi_row(total_to_produce, pending_orders, in_progress_orders, up_n
         ), md=3),
     ]
 
+def make_notifications(pur_orders, ip_orders, inv_kpi):
+    """Build notification badges: pending POs, in-progress production, low stock."""
+    badges = []
+
+    # Pending purchase orders (not yet delivered)
+    if not pur_orders.empty and "STATUS" in pur_orders.columns:
+        pending_po = pur_orders[pur_orders["STATUS"].str.lower() != "delivered"]
+        for _, row in pending_po.iterrows():
+            qty = f"{float(row['QUANTITY']):,.0f} {row.get('UNIT','')}"
+            due = row.get("GOODS_RECEIPT_DATE", "?")
+            badges.append(dbc.Badge(
+                f"📦 PO {row['PURCHASING_ORDER']} · {row['MATERIAL_DESCRIPTION']} · {qty} · due {due}",
+                color="warning", className="me-2 mb-1 p-2", style={"fontSize":"0.78rem","fontWeight":"500"},
+            ))
+
+    # In-progress production orders
+    if not ip_orders.empty:
+        for _, row in ip_orders.iterrows():
+            end = row.get("END_LABEL", f"step {row.get('END_ELAPSED','?')}")
+            badges.append(dbc.Badge(
+                f"⚙ IN PRODUCTION · {row['MATERIAL_DESCRIPTION']} · {int(row.get('TARGET_QUANTITY',0)):,} units · ends {end}",
+                color="info", className="me-2 mb-1 p-2", style={"fontSize":"0.78rem","fontWeight":"500"},
+            ))
+
+    # Low stock alerts
+    if not inv_kpi.empty and "NB_STEPS_AVAILABLE" in inv_kpi.columns and "MATERIAL_NUMBER" in inv_kpi.columns:
+        low = (inv_kpi[inv_kpi["NB_STEPS_AVAILABLE"] < 10]
+               .groupby(["MATERIAL_NUMBER","MATERIAL_DESCRIPTION"])["NB_STEPS_AVAILABLE"]
+               .mean().reset_index())
+        for _, row in low.iterrows():
+            steps = row["NB_STEPS_AVAILABLE"]
+            clr = "danger" if steps < 5 else "warning"
+            badges.append(dbc.Badge(
+                f"⚠ LOW STOCK · {row['MATERIAL_NUMBER']} {row['MATERIAL_DESCRIPTION']} · {steps:.0f} steps left",
+                color=clr, className="me-2 mb-1 p-2", style={"fontSize":"0.78rem","fontWeight":"500"},
+            ))
+
+    if not badges:
+        badges = [dbc.Badge(
+            "✓ All orders on track · No alerts",
+            color="success", className="me-2 p-2", style={"fontSize":"0.78rem"},
+        )]
+    return badges
+
 def make_sustain_kpi_row(carbon, total_co2):
     last_co2 = (carbon[carbon['SIM_ELAPSED_STEPS']==carbon['SIM_ELAPSED_STEPS'].max()]['CO2E_EMISSIONS'].sum()
                 if (not carbon.empty and 'SIM_ELAPSED_STEPS' in carbon.columns) else 0)
@@ -750,19 +806,52 @@ def make_sustain_kpi_row(carbon, total_co2):
 
 # ── App ────────────────────────────────────────────────────────────────────────
 app = dash.Dash(__name__, external_stylesheets=[dbc.themes.CYBORG],
-                title="ERPsim Dashboard · Team AA")
+                title="ERPsim Dashboard")
+
+_LOGIN_OVERLAY = html.Div(id="login-overlay", style={
+    "position":"fixed","top":0,"left":0,"width":"100%","height":"100%",
+    "backgroundColor":"#0f1117","zIndex":9999,
+    "display":"flex","alignItems":"center","justifyContent":"center",
+}, children=[
+    dbc.Card(style={"width":"380px","background":"#1a1d27","border":"1px solid #2a2d3e","borderRadius":"12px"},
+    children=[
+        dbc.CardBody([
+            html.H4("ERPsim Dashboard", className="text-white text-center mb-1",
+                    style={"fontWeight":"700"}),
+            html.P("SAP Client 435 · UWM", className="text-muted text-center mb-4",
+                   style={"fontSize":"0.85rem"}),
+            dbc.Label("Username", style={"color":"#8b90a0","fontSize":"0.82rem"}),
+            dbc.Input(id="input-username", placeholder="e.g. A_1", type="text",
+                      className="mb-3",
+                      style={"background":"#0f1117","color":"#fff","border":"1px solid #2a2d3e"}),
+            dbc.Label("Password", style={"color":"#8b90a0","fontSize":"0.82rem"}),
+            dbc.Input(id="input-password", placeholder="Password", type="password",
+                      className="mb-3",
+                      style={"background":"#0f1117","color":"#fff","border":"1px solid #2a2d3e"}),
+            dbc.Button("Connect", id="login-btn", color="primary", className="w-100 mb-2"),
+            html.Div(id="login-status", className="text-center",
+                     style={"color":RED,"fontSize":"0.83rem","minHeight":"20px"}),
+        ])
+    ])
+])
 
 app.layout = dbc.Container(fluid=True,
     style={"backgroundColor": BG, "minHeight":"100vh", "padding":"20px"}, children=[
 
+    dcc.Store(id="auth-store", storage_type="session"),
     dcc.Interval(id="refresh", interval=REFRESH_S * 1000, n_intervals=0),
+    _LOGIN_OVERLAY,
+
+    # Main dashboard (hidden until logged in)
+    html.Div(id="main-content", style={"display":"none"}, children=[
 
     # Header
     dbc.Row(className="mb-3", children=[
         dbc.Col([
             html.H2("ERPsim Dashboard",
                     style={"color":"#fff","fontWeight":"700","marginBottom":"2px"}),
-            html.Small("Team AA · SAP Client 435 · UWM", className="text-muted"),
+            html.Div(id="header-subtitle",
+                     children=html.Small("SAP Client 435 · UWM", className="text-muted")),
         ], width=8),
         dbc.Col([
             html.Div(id="header-info", children=make_header_info(latest_val),
@@ -773,6 +862,19 @@ app.layout = dbc.Container(fluid=True,
     # Top KPI row
     dbc.Row(id="top-kpi-row", className="mb-3 g-3",
             children=make_top_kpi_row(latest_val, total_revenue, total_margin)),
+
+    # Notifications bar
+    dbc.Row(className="mb-3", children=[
+        dbc.Col(html.Div([
+            html.Small("ORDERS & ALERTS  ",
+                       style={"color":"#8b90a0","fontWeight":"600","letterSpacing":"0.05em",
+                              "fontSize":"0.72rem","marginRight":"6px","verticalAlign":"middle"}),
+            html.Span(id="notifications-bar",
+                      children=make_notifications(pur_orders, in_progress_orders, inv_kpi),
+                      style={"display":"inline"}),
+        ], style={"padding":"10px 16px","background":CARD_BG,
+                  "borderRadius":"8px","border":"1px solid #2a2d3e"}))
+    ]),
 
     # Tabs
     dbc.Tabs(style={"borderBottom":"1px solid #2a2d3e"}, children=[
@@ -911,7 +1013,50 @@ app.layout = dbc.Container(fluid=True,
     html.Hr(style={"borderColor":"#2a2d3e","marginTop":"30px"}),
     html.P(f"Auto-refreshes every {REFRESH_S}s  ·  Data: SAP NetWeaver OData · Client 435",
            className="text-center text-muted", style={"fontSize":"0.75rem"}),
+
+    ]),  # end main-content
 ])
+
+# ── Login callback ─────────────────────────────────────────────────────────────
+@callback(
+    Output("auth-store",    "data"),
+    Output("login-status",  "children"),
+    Input("login-btn",      "n_clicks"),
+    State("input-username", "value"),
+    State("input-password", "value"),
+    prevent_initial_call=True,
+)
+def do_login(n_clicks, username, password):
+    if not username or not password:
+        return no_update, "Please enter username and password."
+    username = username.strip()
+    password = password.strip()
+    try:
+        r = requests.get(f"{BASE_URL}/Company_Valuation", auth=(username, password),
+                         params={"$format":"json","$top":"1"}, timeout=10)
+        if r.status_code == 200:
+            team = username.split("_")[0].upper()
+            return {"username": username, "password": password, "team": team}, ""
+        return no_update, f"Login failed — check credentials (HTTP {r.status_code})."
+    except Exception as e:
+        return no_update, f"Connection error: {e}"
+
+@callback(
+    Output("login-overlay", "style"),
+    Output("main-content",  "style"),
+    Output("header-subtitle", "children"),
+    Input("auth-store", "data"),
+)
+def toggle_auth(auth_data):
+    hidden  = {"display":"none"}
+    overlay = {"position":"fixed","top":0,"left":0,"width":"100%","height":"100%",
+                "backgroundColor":"#0f1117","zIndex":9999,
+                "display":"flex","alignItems":"center","justifyContent":"center"}
+    if auth_data:
+        team = auth_data.get("team","?")
+        subtitle = html.Small(f"Team {team} · SAP Client 435 · UWM", className="text-muted")
+        return hidden, {"display":"block"}, subtitle
+    return overlay, hidden, no_update
 
 # ── Live refresh callback ──────────────────────────────────────────────────────
 @callback(
@@ -945,12 +1090,17 @@ app.layout = dbc.Container(fluid=True,
     Output("div-current-prod", "children"),
     Output("div-up-next",      "children"),
     Output("div-prod-queue",   "children"),
-    Output("capacity-row",     "children"),
+    Output("capacity-row",        "children"),
+    Output("notifications-bar",   "children"),
     Input("refresh", "n_intervals"),
+    State("auth-store", "data"),
 )
-def refresh_all(n):
+def refresh_all(n, auth_data):
+    if not auth_data:
+        return tuple([no_update] * 29)
+    auth = (auth_data["username"], auth_data["password"])
     # Reload all data from OData
-    s, v, ik, mkt, c, p, po, ih, pr = load_all()
+    s, v, ik, mkt, c, p, po, ih, pr, pur = load_all(auth)
     (lv, tr, tm, tco2, ce, tp, ays,
      ip_orders, un_orders, pend, ttp, po) = compute_derived(s, v, ik, c, p, po)
 
@@ -988,6 +1138,7 @@ def refresh_all(n):
         up_next_card(un_orders, ce),
         prod_order_table(po),
         make_capacity_section(ih),
+        make_notifications(pur, ip_orders, ik),
     )
 
 if __name__ == "__main__":
