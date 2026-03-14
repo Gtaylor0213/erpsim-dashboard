@@ -1,3 +1,4 @@
+import os
 import requests
 import pandas as pd
 import plotly.express as px
@@ -807,6 +808,7 @@ def make_sustain_kpi_row(carbon, total_co2):
 # ── App ────────────────────────────────────────────────────────────────────────
 app = dash.Dash(__name__, external_stylesheets=[dbc.themes.CYBORG],
                 title="ERPsim Dashboard")
+server = app.server
 
 _LOGIN_OVERLAY = html.Div(id="login-overlay", style={
     "position":"fixed","top":0,"left":0,"width":"100%","height":"100%",
@@ -854,8 +856,12 @@ app.layout = dbc.Container(fluid=True,
                      children=html.Small("SAP Client 435 · UWM", className="text-muted")),
         ], width=8),
         dbc.Col([
-            html.Div(id="header-info", children=make_header_info(latest_val),
-                     className="text-end mt-2"),
+            html.Div([
+                html.Div(id="header-info", children=make_header_info(latest_val),
+                         className="mb-1"),
+                dbc.Button("Switch Team", id="logout-btn", size="sm", color="secondary",
+                           outline=True, style={"fontSize":"0.72rem","padding":"2px 10px"}),
+            ], className="text-end mt-1"),
         ], width=4),
     ]),
 
@@ -1040,6 +1046,14 @@ def do_login(n_clicks, username, password):
         return no_update, f"Login failed — check credentials (HTTP {r.status_code})."
     except Exception as e:
         return no_update, f"Connection error: {e}"
+
+@callback(
+    Output("auth-store", "data", allow_duplicate=True),
+    Input("logout-btn", "n_clicks"),
+    prevent_initial_call=True,
+)
+def do_logout(n):
+    return None
 
 @callback(
     Output("login-overlay", "style"),
