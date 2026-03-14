@@ -47,8 +47,8 @@ _VAL_EMPTY = {
 }
 
 # ── Data helpers ───────────────────────────────────────────────────────────────
-def fetch(entity, auth):
-    url = f"{BASE_URL}/{entity}?$format=json"
+def fetch(entity, auth, base_url=None):
+    url = f"{base_url or BASE_URL}/{entity}?$format=json"
     resp = requests.get(url, auth=auth, timeout=30)
     resp.raise_for_status()
     rows = resp.json()["d"]["results"]
@@ -68,17 +68,18 @@ def rs_to_elapsed(round_str, step_str):
     except Exception:
         return 0
 
-def load_all(auth):
-    sales       = fetch("Sales",                     auth)
-    valuation   = fetch("Company_Valuation",         auth)
-    inv_kpi     = fetch("Current_Inventory_KPI",     auth)
-    market      = fetch("Market",                    auth)
-    carbon      = fetch("Carbon_Emissions",          auth)
-    prod        = fetch("Production",                auth)
-    prod_orders = fetch("Production_Orders",         auth)
-    inv_hist    = fetch("Inventory",                 auth)
-    pricing     = fetch("Current_Pricing_Conditions",auth)
-    pur_orders  = fetch("Purchase_Orders",           auth)
+def load_all(auth, base_url=None):
+    kw = dict(auth=auth, base_url=base_url)
+    sales       = fetch("Sales",                      **kw)
+    valuation   = fetch("Company_Valuation",          **kw)
+    inv_kpi     = fetch("Current_Inventory_KPI",      **kw)
+    market      = fetch("Market",                     **kw)
+    carbon      = fetch("Carbon_Emissions",           **kw)
+    prod        = fetch("Production",                 **kw)
+    prod_orders = fetch("Production_Orders",          **kw)
+    inv_hist    = fetch("Inventory",                  **kw)
+    pricing     = fetch("Current_Pricing_Conditions", **kw)
+    pur_orders  = fetch("Purchase_Orders",            **kw)
 
     sales       = to_num(sales,       ["QUANTITY","QUANTITY_DELIVERED","NET_PRICE","NET_VALUE","COST","SIM_ELAPSED_STEPS","SIM_PERIOD"])
     valuation   = to_num(valuation,   ["BANK_CASH_ACCOUNT","ACCOUNTS_RECEIVABLE","BANK_LOAN",
@@ -815,13 +816,18 @@ _LOGIN_OVERLAY = html.Div(id="login-overlay", style={
     "backgroundColor":"#0f1117","zIndex":9999,
     "display":"flex","alignItems":"center","justifyContent":"center",
 }, children=[
-    dbc.Card(style={"width":"380px","background":"#1a1d27","border":"1px solid #2a2d3e","borderRadius":"12px"},
+    dbc.Card(style={"width":"420px","background":"#1a1d27","border":"1px solid #2a2d3e","borderRadius":"12px"},
     children=[
         dbc.CardBody([
             html.H4("ERPsim Dashboard", className="text-white text-center mb-1",
                     style={"fontWeight":"700"}),
-            html.P("SAP Client 435 · UWM", className="text-muted text-center mb-4",
+            html.P("Connect to your SAP OData server", className="text-muted text-center mb-4",
                    style={"fontSize":"0.85rem"}),
+            dbc.Label("OData URL", style={"color":"#8b90a0","fontSize":"0.82rem"}),
+            dbc.Input(id="input-url", value=BASE_URL, type="text",
+                      className="mb-3",
+                      style={"background":"#0f1117","color":"#fff","border":"1px solid #2a2d3e",
+                             "fontSize":"0.82rem"}),
             dbc.Label("Username", style={"color":"#8b90a0","fontSize":"0.82rem"}),
             dbc.Input(id="input-username", placeholder="e.g. A_1", type="text",
                       className="mb-3",
@@ -1028,21 +1034,24 @@ app.layout = dbc.Container(fluid=True,
     Output("auth-store",    "data"),
     Output("login-status",  "children"),
     Input("login-btn",      "n_clicks"),
+    State("input-url",      "value"),
     State("input-username", "value"),
     State("input-password", "value"),
     prevent_initial_call=True,
 )
-def do_login(n_clicks, username, password):
-    if not username or not password:
-        return no_update, "Please enter username and password."
-    username = username.strip()
-    password = password.strip()
+def do_login(n_clicks, base_url, username, password):
+    if not base_url or not username or not password:
+        return no_update, "Please fill in all fields."
+    base_url  = base_url.rstrip("/")
+    username  = username.strip()
+    password  = password.strip()
     try:
-        r = requests.get(f"{BASE_URL}/Company_Valuation", auth=(username, password),
+        r = requests.get(f"{base_url}/Company_Valuation", auth=(username, password),
                          params={"$format":"json","$top":"1"}, timeout=10)
         if r.status_code == 200:
             team = username.split("_")[0].upper()
-            return {"username": username, "password": password, "team": team}, ""
+            return {"base_url": base_url, "username": username,
+                    "password": password, "team": team}, ""
         return no_update, f"Login failed — check credentials (HTTP {r.status_code})."
     except Exception as e:
         return no_update, f"Connection error: {e}"
@@ -1112,9 +1121,10 @@ def toggle_auth(auth_data):
 def refresh_all(n, auth_data):
     if not auth_data:
         return tuple([no_update] * 29)
-    auth = (auth_data["username"], auth_data["password"])
+    auth     = (auth_data["username"], auth_data["password"])
+    base_url = auth_data.get("base_url", BASE_URL)
     # Reload all data from OData
-    s, v, ik, mkt, c, p, po, ih, pr, pur = load_all(auth)
+    s, v, ik, mkt, c, p, po, ih, pr, pur = load_all(auth, base_url)
     (lv, tr, tm, tco2, ce, tp, ays,
      ip_orders, un_orders, pend, ttp, po) = compute_derived(s, v, ik, c, p, po)
 
