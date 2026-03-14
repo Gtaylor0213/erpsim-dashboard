@@ -222,7 +222,7 @@ def kpi_card(title, value, sub=None, color=ACCENT):
         ])
     ], style={"background": CARD_BG, "border":"1px solid #2a2d3e", "borderRadius":"10px"}, className="h-100")
 
-def chart_card(title, graph_id, fig=None):
+def chart_card(title, graph_id, fig=None, height="280px"):
     if fig is not None:
         fig = style_fig(fig)
     return dbc.Card([
@@ -231,7 +231,8 @@ def chart_card(title, graph_id, fig=None):
                     style={"color":"#8b90a0","textTransform":"uppercase",
                            "letterSpacing":"0.08em","fontSize":"0.75rem"}),
             dcc.Graph(id=graph_id, figure=fig or empty_fig(),
-                      config={"displayModeBar": False}, style={"height":"280px"}),
+                      config={"displayModeBar": False},
+                      style={"height": height} if height else {}),
         ])
     ], style={"background": CARD_BG, "border":"1px solid #2a2d3e", "borderRadius":"10px"})
 
@@ -427,22 +428,30 @@ def fig_price_heatmap(pricing, market):
     z_df   = merged.pivot(index="MATERIAL_DESCRIPTION", columns="DC_NAME", values="PCT_DIFF")
     txt_df = merged.pivot(index="MATERIAL_DESCRIPTION", columns="DC_NAME", values="LABEL")
 
-    # Colorscale: red (low) → green (close) → orange (high)
-    # Clamp to ±20% range; 0% → green
+    # Cell labels: blank for NaN cells so we don't show stray "%"
+    import numpy as np
+    cell_text = pd.DataFrame(
+        [[f"{v:+.1f}%" if pd.notna(v) else "" for v in row] for row in z_df.values],
+        index=z_df.index, columns=z_df.columns,
+    )
+    # Hover text: replace NaN with "No data"
+    hover_text = txt_df.fillna("No data")
+
     CLAMP = 20
     colorscale = [
-        [0.0,  "#e74c3c"],   # -20% or lower: red
-        [0.5,  "#2ecc71"],   # 0%: green
-        [1.0,  "#f39c12"],   # +20% or higher: orange
+        [0.0,  "#e74c3c"],
+        [0.5,  "#2ecc71"],
+        [1.0,  "#f39c12"],
     ]
 
     fig = go.Figure(go.Heatmap(
         z=z_df.values,
         x=z_df.columns.tolist(),
         y=z_df.index.tolist(),
-        text=txt_df.values,
-        hovertemplate="%{y}<br>%{x}<br>%{text}<extra></extra>",
-        texttemplate="%{z:+.1f}%",
+        customdata=hover_text.values,
+        hovertemplate="%{y}<br>%{x}<br>%{customdata}<extra></extra>",
+        text=cell_text.values,
+        texttemplate="%{text}",
         colorscale=colorscale,
         zmin=-CLAMP, zmid=0, zmax=CLAMP,
         colorbar=dict(
@@ -452,10 +461,12 @@ def fig_price_heatmap(pricing, market):
             tickfont=dict(color="#c8cdd8"),
         ),
     ))
+    # Dynamic height: 60px per row, min 360
+    row_height = max(360, len(z_df) * 62 + 120)
     fig.update_layout(
         xaxis_title="Distribution Channel",
         yaxis_title="",
-        height=480,
+        height=row_height,
         xaxis=dict(side="top"),
     )
     return fig
@@ -1117,7 +1128,7 @@ app.layout = dbc.Container(fluid=True,
         dbc.Tab(label="Pricing", tab_style={"color":"#8b90a0"}, active_tab_style={"color":"#fff"}, children=[
             dbc.Row(className="mt-3 g-3", children=[
                 dbc.Col(chart_card("Our Price vs Market Average — Heatmap", "g-price-heatmap",
-                                   fig_price_heatmap(pricing, market)), md=12),
+                                   fig_price_heatmap(pricing, market), height=None), md=12),
             ]),
             dbc.Row(className="mt-3 g-3", children=[
                 dbc.Col(chart_card("Our Price vs Market Average — By Product", "g-price-bar",
