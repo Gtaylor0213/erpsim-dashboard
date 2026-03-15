@@ -83,6 +83,7 @@ def load_all(auth, base_url=None):
     inv_hist    = fetch("Inventory",                  **kw)
     pricing     = fetch("Current_Pricing_Conditions", **kw)
     pur_orders  = fetch("Purchase_Orders",            **kw)
+    ind_req     = fetch("Independent_Requirements",   **kw)
 
     sales       = to_num(sales,       ["QUANTITY","QUANTITY_DELIVERED","NET_PRICE","NET_VALUE","COST","SIM_ELAPSED_STEPS","SIM_PERIOD"])
     valuation   = to_num(valuation,   ["BANK_CASH_ACCOUNT","ACCOUNTS_RECEIVABLE","BANK_LOAN",
@@ -132,10 +133,11 @@ def load_all(auth, base_url=None):
     else:
         inv_hist["MAT_TYPE"] = pd.Series(dtype=str)
 
-    pricing = to_num(pricing, ["PRICE"])
+    pricing    = to_num(pricing,    ["PRICE"])
     pur_orders = to_num(pur_orders, ["QUANTITY", "UNIT_PRICE", "SIM_ELAPSED_STEPS"])
+    ind_req    = to_num(ind_req,    ["QUANTITY", "SIM_ELAPSED_STEPS"])
 
-    return sales, valuation, inv_kpi, market, carbon, prod, prod_orders, inv_hist, pricing, pur_orders
+    return sales, valuation, inv_kpi, market, carbon, prod, prod_orders, inv_hist, pricing, pur_orders, ind_req
 
 def compute_derived(sales, valuation, inv_kpi, carbon, prod, prod_orders):
     latest_val     = valuation.sort_values("SIM_ELAPSED_STEPS").iloc[-1] if not valuation.empty else pd.Series(_VAL_EMPTY)
@@ -176,7 +178,7 @@ def compute_derived(sales, valuation, inv_kpi, carbon, prod, prod_orders):
 
 # ── Initial load ───────────────────────────────────────────────────────────────
 _edf = pd.DataFrame()
-sales = valuation = inv_kpi = market = carbon = prod = prod_orders = inv_hist = pricing = pur_orders = _edf
+sales = valuation = inv_kpi = market = carbon = prod = prod_orders = inv_hist = pricing = pur_orders = ind_req = _edf
 latest_val         = pd.Series(_VAL_EMPTY)
 total_revenue      = total_margin = total_co2 = 0
 total_produced     = avg_yield_step = current_elapsed = 0
@@ -812,6 +814,208 @@ def make_notifications(pur_orders, ip_orders, inv_kpi):
         )]
     return badges
 
+# ── Forecast & MRP charts ──────────────────────────────────────────────────────
+
+@safe
+def fig_sales_velocity(sales):
+    """Sales units per step per product with 3-step moving average and 5-step projection."""
+    if sales.empty or "SIM_ELAPSED_STEPS" not in sales.columns:
+        return empty_fig("No sales data yet")
+    df = sales.groupby(["SIM_ELAPSED_STEPS","MATERIAL_DESCRIPTION"], as_index=False)["QUANTITY"].sum()
+    fig = go.Figure()
+    current_step = int(df["SIM_ELAPSED_STEPS"].max())
+    proj_steps = list(range(current_step + 1, current_step + 6))
+
+    for i, (prod, grp) in enumerate(df.groupby("MATERIAL_DESCRIPTION")):
+        grp = grp.sort_values("SIM_ELAPSED_STEPS")
+        color = COLORS[i % len(COLORS)]
+        # Actual sales
+        fig.add_trace(go.Scatter(
+            x=grp["SIM_ELAPSED_STEPS"], y=grp["QUANTITY"],
+            name=prod, mode="lines+markers",
+            line=dict(color=color, width=1.5), marker=dict(size=4),
+            legendgroup=prod,
+        ))
+        # 3-step moving average
+        grp["MA3"] = grp["QUANTITY"].rolling(3, min_periods=1).mean()
+        fig.add_trace(go.Scatter(
+            x=grp["SIM_ELAPSED_STEPS"], y=grp["MA3"],
+            name=f"{prod} (3-step MA)", mode="lines",
+            line=dict(color=color, width=2, dash="dot"),
+            legendgroup=prod, showlegend=False,
+        ))
+        # 5-step projection from last 3-step average
+        avg_rate = grp["QUANTITY"].iloc[-3:].mean() if len(grp) >= 3 else grp["QUANTITY"].mean()
+        fig.add_trace(go.Scatter(
+            x=[current_step] + proj_steps,
+            y=[grp["QUANTITY"].iloc[-1]] + [avg_rate] * 5,
+            name=f"{prod} (forecast)", mode="lines",
+            line=dict(color=color, width=2, dash="dash"),
+            legendgroup=prod, showlegend=False,
+        ))
+
+    fig.add_vline(x=current_step, line_dash="dot", line_color="#8b90a0",
+                  annotation_text="Now", annotation_font_color="#8b90a0")
+    fig.update_layout(hovermode="x unified", yaxis_title="Units Sold",
+                      xaxis_title="Step", legend=dict(orientation="h", y=-0.2))
+    return fig
+
+
+@safe
+def fig_stockout_timeline(inv_kpi, prod_orders):
+    """Horizontal bar: steps of FG stock remaining, vs when next production run delivers."""
+    if inv_kpi.empty:
+        return empty_fig("No inventory data yet")
+    df = inv_kpi[inv_kpi["MATERIAL_NUMBER"].str.startswith("AA-F", na=False)].copy()
+    df = df.groupby(["MATERIAL_NUMBER","MATERIAL_DESCRIPTION"], as_index=False).agg(
+        stock=("CURRENT_INVENTORY","sum"),
+        days=("NB_STEPS_AVAILABLE","mean"),
+    )
+    df = df.sort_values("days")
+    df["LABEL"] = df["MATERIAL_NUMBER"].str.strip() + " · " + df["MATERIAL_DESCRIPTION"]
+    colors = [RED if v < 5 else (YELLOW if v < 10 else GREEN) for v in df["days"]]
+
+    fig = go.Figure()
+    fig.add_bar(
+        x=df["days"], y=df["LABEL"], orientation="h",
+        marker_color=colors,
+        text=[f"{v:.0f} steps" for v in df["days"]],
+        textposition="inside",
+        hovertemplate="%{y}<br>%{x:.1f} steps of stock<extra></extra>",
+        name="Steps of Stock",
+    )
+
+    # Overlay next production end step as a marker
+    if not prod_orders.empty and "STATUS" in prod_orders.columns and "END_ELAPSED" in prod_orders.columns:
+        current_step = inv_kpi["SIM_ELAPSED_STEPS"].max() if "SIM_ELAPSED_STEPS" in inv_kpi.columns else 0
+        queued = prod_orders[prod_orders["STATUS"].isin(["In Progress","Up Next","Queued"])]
+        for _, row in queued.iterrows():
+            mat_desc = row.get("MATERIAL_DESCRIPTION","")
+            label_match = df[df["MATERIAL_DESCRIPTION"] == mat_desc]["LABEL"]
+            if label_match.empty:
+                continue
+            steps_until_done = max(0, int(row["END_ELAPSED"]) - int(current_step))
+            fig.add_trace(go.Scatter(
+                x=[steps_until_done], y=[label_match.iloc[0]],
+                mode="markers", marker=dict(color="#4f8ef7", size=12, symbol="diamond"),
+                name=f"Next run: {mat_desc}", showlegend=False,
+                hovertemplate=f"{mat_desc}<br>Production delivers in {steps_until_done} steps<extra></extra>",
+            ))
+
+    fig.add_vline(x=5,  line_dash="dash", line_color=RED,    annotation_text="Critical (5)",  annotation_font_color=RED)
+    fig.add_vline(x=10, line_dash="dash", line_color=YELLOW,  annotation_text="Warning (10)", annotation_font_color=YELLOW)
+    fig.update_layout(xaxis_title="Steps of Stock Remaining", yaxis_title="",
+                      height=max(300, len(df) * 48 + 80))
+    return fig
+
+
+@safe
+def fig_rm_coverage(inv_hist, pur_orders):
+    """RM & Packaging: current stock vs lead time threshold. Red = order now."""
+    if inv_hist.empty or "MAT_TYPE" not in inv_hist.columns:
+        return empty_fig("No inventory history yet")
+
+    # Latest RM/PKG stock from history
+    latest = inv_hist["SIM_ELAPSED_STEPS"].max()
+    rm = inv_hist[
+        inv_hist["SIM_ELAPSED_STEPS"] == latest
+    ].copy()
+    rm = rm[rm["MAT_TYPE"].isin(["Raw Materials","Packaging"])]
+    if rm.empty:
+        return empty_fig("No RM/Packaging inventory data yet")
+
+    rm = rm.groupby(["MATERIAL_NUMBER","MAT_TYPE"], as_index=False)["INVENTORY_OPENING_BALANCE"].sum()
+
+    # Average daily consumption: (max historical stock - current) / elapsed steps
+    elapsed = int(latest)
+    rm_hist = inv_hist[inv_hist["MAT_TYPE"].isin(["Raw Materials","Packaging"])]
+    max_stock = rm_hist.groupby("MATERIAL_NUMBER")["INVENTORY_OPENING_BALANCE"].max().reset_index()
+    max_stock.rename(columns={"INVENTORY_OPENING_BALANCE":"MAX_STOCK"}, inplace=True)
+    rm = rm.merge(max_stock, on="MATERIAL_NUMBER", how="left")
+    rm["AVG_CONSUMPTION"] = ((rm["MAX_STOCK"] - rm["INVENTORY_OPENING_BALANCE"]) / elapsed).clip(lower=0.1)
+    rm["STEPS_COVERAGE"] = (rm["INVENTORY_OPENING_BALANCE"] / rm["AVG_CONSUMPTION"]).round(1)
+
+    # Lead times from purchase order history
+    if not pur_orders.empty and "SIM_ELAPSED_STEPS" in pur_orders.columns:
+        po = pur_orders.copy()
+        po["GR_ELAPSED"] = po.apply(
+            lambda r: rs_to_elapsed(str(r.get("GOODS_RECEIPT_ROUND","1")), str(r.get("GOODS_RECEIPT_STEP","1"))), axis=1)
+        po["LEAD_TIME"] = po["GR_ELAPSED"] - po["SIM_ELAPSED_STEPS"]
+        lt = po.groupby("MATERIAL_NUMBER")["LEAD_TIME"].mean().reset_index()
+        lt.rename(columns={"LEAD_TIME":"AVG_LEAD_TIME"}, inplace=True)
+        rm = rm.merge(lt, on="MATERIAL_NUMBER", how="left")
+    else:
+        rm["AVG_LEAD_TIME"] = 2.0
+
+    rm["AVG_LEAD_TIME"] = rm["AVG_LEAD_TIME"].fillna(2.0)
+    rm = rm.sort_values("STEPS_COVERAGE")
+    colors = [RED if row["STEPS_COVERAGE"] <= row["AVG_LEAD_TIME"]
+              else (YELLOW if row["STEPS_COVERAGE"] <= row["AVG_LEAD_TIME"] * 2 else GREEN)
+              for _, row in rm.iterrows()]
+
+    fig = go.Figure()
+    fig.add_bar(
+        x=rm["STEPS_COVERAGE"], y=rm["MATERIAL_NUMBER"],
+        orientation="h", marker_color=colors,
+        text=[f"{v:.1f} steps" for v in rm["STEPS_COVERAGE"]],
+        textposition="inside",
+        hovertemplate="%{y}<br>Coverage: %{x:.1f} steps<extra></extra>",
+        name="Steps of Coverage",
+    )
+    # Lead time reference line (use mode value)
+    avg_lt = rm["AVG_LEAD_TIME"].median()
+    fig.add_vline(x=avg_lt, line_dash="dash", line_color=RED,
+                  annotation_text=f"Lead time ({avg_lt:.0f} steps) — Order Now",
+                  annotation_font_color=RED)
+    fig.add_vline(x=avg_lt * 2, line_dash="dot", line_color=YELLOW,
+                  annotation_text="Reorder Soon",
+                  annotation_font_color=YELLOW)
+    fig.update_layout(xaxis_title="Steps of Stock Coverage", yaxis_title="",
+                      height=max(300, len(rm) * 40 + 80))
+    return fig
+
+
+@safe
+def fig_demand_vs_actual(ind_req, sales):
+    """Planned demand (Independent Requirements) vs actual cumulative sales per product."""
+    if ind_req.empty or sales.empty:
+        return empty_fig("No demand data yet")
+
+    planned = ind_req.groupby("MATERIAL_NUMBER", as_index=False)["QUANTITY"].sum()
+    planned.rename(columns={"QUANTITY":"PLANNED"}, inplace=True)
+
+    # Map material number to description
+    if "MATERIAL_DESCRIPTION" in sales.columns:
+        desc_map = sales.drop_duplicates("MATERIAL_NUMBER")[["MATERIAL_NUMBER","MATERIAL_DESCRIPTION"]] \
+            if "MATERIAL_NUMBER" in sales.columns \
+            else pd.DataFrame(columns=["MATERIAL_NUMBER","MATERIAL_DESCRIPTION"])
+        planned = planned.merge(desc_map, on="MATERIAL_NUMBER", how="left")
+
+    actual = sales.groupby("MATERIAL_NUMBER", as_index=False)["QUANTITY"].sum() \
+        if "MATERIAL_NUMBER" in sales.columns \
+        else sales.groupby("MATERIAL_DESCRIPTION", as_index=False)["QUANTITY"].sum()
+    actual.rename(columns={"QUANTITY":"ACTUAL"}, inplace=True)
+
+    merged = planned.merge(actual, on="MATERIAL_NUMBER", how="left").fillna(0)
+    merged["FILL_RATE"] = (merged["ACTUAL"] / merged["PLANNED"] * 100).clip(upper=150).round(1)
+    merged["LABEL"] = merged["MATERIAL_NUMBER"].str.strip() + " · " + merged.get("MATERIAL_DESCRIPTION", merged["MATERIAL_NUMBER"]).fillna("")
+    merged = merged.sort_values("FILL_RATE")
+
+    fig = go.Figure()
+    fig.add_bar(name="Planned Demand", x=merged["LABEL"], y=merged["PLANNED"],
+                marker_color=ACCENT + "66",
+                hovertemplate="%{x}<br>Planned: %{y:,}<extra></extra>")
+    fig.add_bar(name="Actual Sales", x=merged["LABEL"], y=merged["ACTUAL"],
+                marker_color=[GREEN if v >= 90 else (YELLOW if v >= 60 else RED)
+                               for v in merged["FILL_RATE"]],
+                hovertemplate="%{x}<br>Actual: %{y:,}<br>Fill rate: " +
+                              merged["FILL_RATE"].astype(str) + "%<extra></extra>")
+    fig.update_layout(barmode="overlay", xaxis_tickangle=-35,
+                      yaxis_title="Units", hovermode="x unified",
+                      legend=dict(orientation="h", y=-0.25))
+    return fig
+
+
 def make_data_snapshot(lv, tr, tm, ik, ip_orders, pr, mkt):
     """Build a compact JSON-serialisable summary of current game state for AI context."""
     snap = {
@@ -1136,6 +1340,24 @@ app.layout = dbc.Container(fluid=True,
             ]),
         ]),
 
+        # Forecast & MRP
+        dbc.Tab(label="Forecast & MRP", tab_style={"color":"#8b90a0"}, active_tab_style={"color":"#fff"}, children=[
+            dbc.Row(className="mt-3 g-3", children=[
+                dbc.Col(chart_card("Sales Velocity & 5-Step Forecast (units/step)", "g-sales-velocity",
+                                   fig_sales_velocity(sales)), md=12),
+            ]),
+            dbc.Row(className="mt-3 g-3", children=[
+                dbc.Col(chart_card("Finished Goods: Steps of Stock Remaining", "g-stockout-timeline",
+                                   fig_stockout_timeline(inv_kpi, prod_orders), height=None), md=6),
+                dbc.Col(chart_card("RM & Packaging: Stock Coverage vs Lead Time", "g-rm-coverage",
+                                   fig_rm_coverage(inv_hist, pur_orders), height=None), md=6),
+            ]),
+            dbc.Row(className="mt-3 g-3", children=[
+                dbc.Col(chart_card("Planned Demand vs Actual Sales (fill rate)", "g-demand-vs-actual",
+                                   fig_demand_vs_actual(ind_req, sales)), md=12),
+            ]),
+        ]),
+
         # Market
         dbc.Tab(label="Market", tab_style={"color":"#8b90a0"}, active_tab_style={"color":"#fff"}, children=[
             dbc.Row(className="mt-3 g-3", children=[
@@ -1237,6 +1459,10 @@ def toggle_auth(auth_data):
     Output("g-yield-product",  "figure"),
     Output("g-price-heatmap",  "figure"),
     Output("g-price-bar",      "figure"),
+    Output("g-sales-velocity",    "figure"),
+    Output("g-stockout-timeline", "figure"),
+    Output("g-rm-coverage",       "figure"),
+    Output("g-demand-vs-actual",  "figure"),
     Output("g-market-share",   "figure"),
     Output("g-carbon-type",    "figure"),
     Output("g-carbon-time",    "figure"),
@@ -1258,11 +1484,11 @@ def toggle_auth(auth_data):
 )
 def refresh_all(n, auth_data):
     if not auth_data:
-        return tuple([no_update] * 30)
+        return tuple([no_update] * 34)
     auth     = (auth_data["username"], auth_data["password"])
     base_url = auth_data.get("base_url", BASE_URL)
     # Reload all data from OData
-    s, v, ik, mkt, c, p, po, ih, pr, pur = load_all(auth, base_url)
+    s, v, ik, mkt, c, p, po, ih, pr, pur, ir = load_all(auth, base_url)
     (lv, tr, tm, tco2, ce, tp, ays,
      ip_orders, un_orders, pend, ttp, po) = compute_derived(s, v, ik, c, p, po)
 
@@ -1288,6 +1514,10 @@ def refresh_all(n, auth_data):
         sf(fig_actual_yield_by_product(p)),
         sf(fig_price_heatmap(pr, mkt)),
         sf(fig_price_vs_market_bar(pr, mkt)),
+        sf(fig_sales_velocity(s)),
+        sf(fig_stockout_timeline(ik, po)),
+        sf(fig_rm_coverage(ih, pur)),
+        sf(fig_demand_vs_actual(ir, s)),
         sf(fig_market_share(s, mkt)),
         sf(fig_carbon_by_type(c)),
         sf(fig_carbon_over_time(c)),
