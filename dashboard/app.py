@@ -14,7 +14,7 @@ BASE_URL      = "http://uno.ucc.uwm.edu/odata/435"
 REFRESH_S     = 20
 ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
-CHANNEL_MAP = {"12": "Wholesale", "14": "Retail"}
+CHANNEL_MAP = {"10": "Hypermarket", "12": "Grocery Chains", "14": "Indept. Grocers"}
 LOC_MAP     = {"02": "Central", "02N": "North", "02S": "South", "02W": "West"}
 STEPS_PER_ROUND = 20
 PROD_WARN_THRESHOLD = 120_000
@@ -84,6 +84,10 @@ def load_all(auth, base_url=None):
     pricing     = fetch("Current_Pricing_Conditions", **kw)
     pur_orders  = fetch("Purchase_Orders",            **kw)
     ind_req     = fetch("Independent_Requirements",   **kw)
+    fin_post    = fetch("Financial_Postings",         **kw)
+    suppliers   = fetch("Current_Suppliers_Prices",   **kw)
+    transfers   = fetch("Stock_Transfers",            **kw)
+    game_rules  = fetch("Current_Game_Rules",         **kw)
 
     sales       = to_num(sales,       ["QUANTITY","QUANTITY_DELIVERED","NET_PRICE","NET_VALUE","COST","SIM_ELAPSED_STEPS","SIM_PERIOD"])
     valuation   = to_num(valuation,   ["BANK_CASH_ACCOUNT","ACCOUNTS_RECEIVABLE","BANK_LOAN",
@@ -136,8 +140,11 @@ def load_all(auth, base_url=None):
     pricing    = to_num(pricing,    ["PRICE"])
     pur_orders = to_num(pur_orders, ["QUANTITY", "UNIT_PRICE", "SIM_ELAPSED_STEPS"])
     ind_req    = to_num(ind_req,    ["QUANTITY", "SIM_ELAPSED_STEPS"])
+    fin_post   = to_num(fin_post,   ["AMOUNT", "SIM_ELAPSED_STEPS"])
+    suppliers  = to_num(suppliers,  ["PRICE"])
+    transfers  = to_num(transfers,  ["QUANTITY", "SIM_ELAPSED_STEPS"])
 
-    return sales, valuation, inv_kpi, market, carbon, prod, prod_orders, inv_hist, pricing, pur_orders, ind_req
+    return sales, valuation, inv_kpi, market, carbon, prod, prod_orders, inv_hist, pricing, pur_orders, ind_req, fin_post, suppliers, transfers, game_rules
 
 def compute_derived(sales, valuation, inv_kpi, carbon, prod, prod_orders):
     latest_val     = valuation.sort_values("SIM_ELAPSED_STEPS").iloc[-1] if not valuation.empty else pd.Series(_VAL_EMPTY)
@@ -178,7 +185,7 @@ def compute_derived(sales, valuation, inv_kpi, carbon, prod, prod_orders):
 
 # ── Initial load ───────────────────────────────────────────────────────────────
 _edf = pd.DataFrame()
-sales = valuation = inv_kpi = market = carbon = prod = prod_orders = inv_hist = pricing = pur_orders = ind_req = _edf
+sales = valuation = inv_kpi = market = carbon = prod = prod_orders = inv_hist = pricing = pur_orders = ind_req = fin_post = suppliers = transfers = game_rules = _edf
 latest_val         = pd.Series(_VAL_EMPTY)
 total_revenue      = total_margin = total_co2 = 0
 total_produced     = avg_yield_step = current_elapsed = 0
@@ -313,8 +320,14 @@ def fig_sales_by_region(sales):
 @safe
 def fig_channel_split(sales):
     df = sales.groupby("CHANNEL", as_index=False).agg(Revenue=("NET_VALUE","sum"), Margin=("MARGIN","sum"))
-    fig = px.bar(df, x="CHANNEL", y=["Revenue","Margin"],
-                 barmode="group", color_discrete_map={"Revenue":ACCENT,"Margin":GREEN})
+    channel_colors = {"Hypermarket": ACCENT, "Grocery Chains": GREEN, "Indept. Grocers": YELLOW}
+    fig = go.Figure()
+    fig.add_bar(x=df["CHANNEL"], y=df["Revenue"], name="Revenue",
+                marker_color=[channel_colors.get(ch, ACCENT) for ch in df["CHANNEL"]], opacity=0.85)
+    fig.add_trace(go.Scatter(x=df["CHANNEL"], y=df["Margin"], name="Margin",
+                             mode="lines+markers", line=dict(color="#fff", width=2),
+                             marker=dict(size=8)))
+    fig.update_layout(barmode="group", hovermode="x unified")
     return fig
 
 @safe
@@ -1016,6 +1029,273 @@ def fig_demand_vs_actual(ind_req, sales):
     return fig
 
 
+@safe
+def fig_cashflow_projection(valuation, game_rules):
+    if valuation.empty:
+        return empty_fig("No valuation data yet")
+    df = valuation.sort_values("SIM_ELAPSED_STEPS")
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=df["SIM_ELAPSED_STEPS"], y=df["BANK_CASH_ACCOUNT"],
+                             name="Cash", mode="lines+markers",
+                             line=dict(color=GREEN, width=2)))
+    if "ACCOUNTS_RECEIVABLE" in df.columns:
+        fig.add_trace(go.Scatter(x=df["SIM_ELAPSED_STEPS"], y=df["ACCOUNTS_RECEIVABLE"],
+                                 name="Accounts Receivable", mode="lines",
+                                 line=dict(color=ACCENT, width=1.5),
+                                 fill="tozeroy", fillcolor="rgba(79,142,247,0.1)"))
+    if "ACCOUNTS_PAYABLE" in df.columns:
+        fig.add_trace(go.Scatter(x=df["SIM_ELAPSED_STEPS"], y=df["ACCOUNTS_PAYABLE"],
+                                 name="Accounts Payable", mode="lines",
+                                 line=dict(color=RED, width=1.5),
+                                 fill="tozeroy", fillcolor="rgba(231,76,60,0.1)"))
+    fig.add_hline(y=0, line_dash="dash", line_color=RED, annotation_text="Bankruptcy Line",
+                  annotation_font_color=RED)
+    # Projected cash drain from overhead (Labor 20k + Mfg 15k + SGA 40k = 75k per 5 steps)
+    overhead_per_step = 75000 / 5  # 15k per step
+    if not df.empty:
+        last_step = int(df["SIM_ELAPSED_STEPS"].max())
+        last_cash = float(df["BANK_CASH_ACCOUNT"].iloc[-1])
+        proj_steps = list(range(last_step, last_step + 11))
+        proj_cash = [last_cash - overhead_per_step * i for i in range(11)]
+        fig.add_trace(go.Scatter(x=proj_steps, y=proj_cash,
+                                 name="Projected Drain (overhead only)",
+                                 mode="lines", line=dict(color=YELLOW, width=2, dash="dash")))
+    fig.update_layout(hovermode="x unified", yaxis_title="EUR")
+    return fig
+
+
+@safe
+def fig_income_waterfall(fin_post):
+    if fin_post.empty:
+        return empty_fig("No financial postings yet")
+    # Filter to Income Statement
+    if "FS_LEVEL_1" not in fin_post.columns:
+        return empty_fig("No income statement data")
+    is_df = fin_post[fin_post["FS_LEVEL_1"] == "Income Statement"].copy()
+    if is_df.empty:
+        return empty_fig("No income statement entries")
+    # Latest period
+    if "SIM_ELAPSED_STEPS" in is_df.columns and not is_df["SIM_ELAPSED_STEPS"].isna().all():
+        latest = is_df["SIM_ELAPSED_STEPS"].max()
+        is_df = is_df[is_df["SIM_ELAPSED_STEPS"] == latest]
+    # Apply debit/credit sign: Credit = positive, Debit = negative for income statement
+    if "DEBIT_CREDIT_INDICATOR" in is_df.columns:
+        is_df["SIGNED_AMOUNT"] = is_df.apply(
+            lambda r: r["AMOUNT"] if str(r.get("DEBIT_CREDIT_INDICATOR","")).upper().startswith("C")
+            else -r["AMOUNT"], axis=1)
+    else:
+        is_df["SIGNED_AMOUNT"] = is_df["AMOUNT"]
+    if "FS_LEVEL_2" in is_df.columns:
+        grouped = is_df.groupby("FS_LEVEL_2", as_index=False)["SIGNED_AMOUNT"].sum()
+    else:
+        grouped = is_df.groupby("FS_LEVEL_1", as_index=False)["SIGNED_AMOUNT"].sum()
+        grouped.rename(columns={"FS_LEVEL_1":"FS_LEVEL_2"}, inplace=True)
+    labels = grouped["FS_LEVEL_2"].tolist()
+    values = grouped["SIGNED_AMOUNT"].tolist()
+    measures = ["relative"] * len(labels)
+    labels.append("Net Profit")
+    values.append(0)
+    measures.append("total")
+    colors = [GREEN if v >= 0 else RED for v in values[:-1]] + [ACCENT]
+    fig = go.Figure(go.Waterfall(
+        x=labels, y=values, measure=measures,
+        connector=dict(line=dict(color="#2a2d3e")),
+        increasing=dict(marker_color=GREEN),
+        decreasing=dict(marker_color=RED),
+        totals=dict(marker_color=ACCENT),
+    ))
+    fig.update_layout(yaxis_title="EUR", showlegend=False)
+    return fig
+
+
+@safe
+def fig_credit_rating(valuation):
+    if valuation.empty:
+        return empty_fig("No valuation data yet")
+    df = valuation.sort_values("SIM_ELAPSED_STEPS")
+    fig = go.Figure()
+    # Map credit ratings to numeric for plotting
+    rating_map = {"AAA": 7, "AA+": 6, "AA": 5, "AA-": 4, "A+": 3, "A": 2, "A-": 1, "BBB": 0}
+    if "CREDIT_RATING" in df.columns:
+        df = df.copy()
+        df["RATING_NUM"] = df["CREDIT_RATING"].map(rating_map)
+        fig.add_trace(go.Scatter(x=df["SIM_ELAPSED_STEPS"], y=df["RATING_NUM"],
+                                 name="Credit Rating", mode="lines+markers",
+                                 line=dict(color=GREEN, width=2),
+                                 text=df["CREDIT_RATING"],
+                                 hovertemplate="Step %{x}<br>Rating: %{text}<extra></extra>"))
+        fig.update_yaxes(tickvals=list(rating_map.values()),
+                         ticktext=list(rating_map.keys()), title="Credit Rating")
+    if "DEBT_LOADING" in df.columns:
+        fig.add_trace(go.Scatter(x=df["SIM_ELAPSED_STEPS"], y=df["DEBT_LOADING"],
+                                 name="Debt Loading", mode="lines+markers",
+                                 line=dict(color=RED, width=2, dash="dash"), yaxis="y2"))
+        fig.update_layout(yaxis2=dict(overlaying="y", side="right", showgrid=False,
+                                       color=RED, title="Debt Loading"))
+    fig.update_layout(hovermode="x unified")
+    return fig
+
+
+@safe
+def fig_po_tracking(pur_orders):
+    if pur_orders.empty:
+        return empty_fig("No purchase orders yet")
+    cols = ["MATERIAL_DESCRIPTION", "VENDOR", "QUANTITY", "UNIT_PRICE", "STATUS",
+            "SIM_ELAPSED_STEPS"]
+    available = [c for c in cols if c in pur_orders.columns]
+    df = pur_orders[available].copy()
+    # Build a clean Plotly table
+    header_labels = []
+    cell_values = []
+    col_map = {"MATERIAL_DESCRIPTION": "Material", "VENDOR": "Vendor",
+               "QUANTITY": "Qty", "UNIT_PRICE": "Unit Price", "STATUS": "Status",
+               "SIM_ELAPSED_STEPS": "Order Step"}
+    for col in available:
+        header_labels.append(col_map.get(col, col))
+        cell_values.append(df[col].tolist())
+    fig = go.Figure(go.Table(
+        header=dict(values=header_labels,
+                    fill_color="#1a1d27", font=dict(color="#8b90a0", size=12),
+                    align="left", line_color="#2a2d3e"),
+        cells=dict(values=cell_values,
+                   fill_color="#0f1117", font=dict(color="#c8cdd8", size=11),
+                   align="left", line_color="#2a2d3e", height=28),
+    ))
+    fig.update_layout(height=max(300, len(df) * 30 + 60))
+    return fig
+
+
+@safe
+def fig_supplier_comparison(suppliers, game_rules):
+    if suppliers.empty:
+        return empty_fig("No supplier price data yet")
+    df = suppliers.copy()
+    vendor_col = "VENDOR" if "VENDOR" in df.columns else ("SUPPLIER" if "SUPPLIER" in df.columns else None)
+    if vendor_col is None:
+        return empty_fig("No vendor column in supplier data")
+    mat_col = "MATERIAL_DESCRIPTION" if "MATERIAL_DESCRIPTION" in df.columns else "MATERIAL_NUMBER"
+    fig = px.bar(df, x=mat_col, y="PRICE", color=vendor_col,
+                 barmode="group", color_discrete_sequence=COLORS,
+                 labels={mat_col: "", "PRICE": "Price per Unit (EUR)"})
+    fig.update_layout(hovermode="x unified", xaxis_tickangle=-35,
+                      legend=dict(orientation="h", y=-0.25))
+    return fig
+
+
+@safe
+def fig_regional_stock(transfers, inv_kpi):
+    if inv_kpi.empty:
+        return empty_fig("No inventory data yet")
+    df = inv_kpi.copy()
+    # Filter finished goods only (material numbers containing "-F")
+    if "MATERIAL_NUMBER" in df.columns:
+        df = df[df["MATERIAL_NUMBER"].str.contains("-F", na=False)]
+    if df.empty:
+        return empty_fig("No finished goods inventory data")
+    if "REGION" not in df.columns and "STORAGE_LOCATION" in df.columns:
+        df["REGION"] = df["STORAGE_LOCATION"].map(LOC_MAP).fillna(df["STORAGE_LOCATION"])
+    grp = df.groupby(["REGION", "MATERIAL_DESCRIPTION"], as_index=False)["CURRENT_INVENTORY"].sum()
+    fig = px.bar(grp, x="REGION", y="CURRENT_INVENTORY", color="MATERIAL_DESCRIPTION",
+                 barmode="stack", color_discrete_sequence=COLORS,
+                 labels={"REGION": "", "CURRENT_INVENTORY": "Stock (units)"})
+    fig.update_layout(hovermode="x unified",
+                      legend=dict(orientation="h", y=-0.25))
+    return fig
+
+
+@safe
+def fig_production_utilization(prod, game_rules):
+    if prod.empty:
+        return empty_fig("No production data yet")
+    # Try to get capacity from game_rules
+    daily_capacity = 250000  # default
+    if not game_rules.empty and "VALUE" in game_rules.columns and "RULE" in game_rules.columns:
+        cap_row = game_rules[game_rules["RULE"].str.contains("Daily Production Capacity", case=False, na=False)]
+        if not cap_row.empty:
+            try:
+                daily_capacity = float(cap_row.iloc[0]["VALUE"])
+            except (ValueError, TypeError):
+                pass
+    df = prod.groupby("SIM_ELAPSED_STEPS", as_index=False)["YIELD"].sum()
+    df["UTIL_PCT"] = (df["YIELD"] / daily_capacity * 100).round(1)
+    colors = [GREEN if v > 80 else (YELLOW if v >= 50 else RED) for v in df["UTIL_PCT"]]
+    fig = go.Figure()
+    fig.add_bar(x=df["SIM_ELAPSED_STEPS"], y=df["UTIL_PCT"],
+                marker_color=colors, name="Utilization %",
+                hovertemplate="Step %{x}<br>%{y:.1f}% capacity<extra></extra>")
+    fig.add_hline(y=100, line_dash="dash", line_color="#fff",
+                  annotation_text="100% Capacity", annotation_font_color="#fff")
+    fig.update_layout(yaxis_title="% of Daily Capacity", xaxis_title="Step",
+                      hovermode="x unified")
+    return fig
+
+
+@safe
+def fig_contribution_margin(sales):
+    if sales.empty:
+        return empty_fig("No sales data yet")
+    df = sales.copy()
+    if "MARGIN" not in df.columns:
+        df["MARGIN"] = df["NET_VALUE"] - df["COST"]
+    grp = df.groupby("MATERIAL_DESCRIPTION", as_index=False).agg(
+        Margin=("MARGIN", "sum"), Revenue=("NET_VALUE", "sum"))
+    grp["MARGIN_PCT"] = (grp["Margin"] / grp["Revenue"] * 100).round(1)
+    grp = grp.sort_values("Margin", ascending=True)
+    fig = px.bar(grp, x="Margin", y="MATERIAL_DESCRIPTION", orientation="h",
+                 color="MARGIN_PCT", color_continuous_scale=["#e74c3c", "#f39c12", "#2ecc71"],
+                 labels={"Margin": "Contribution Margin (EUR)", "MATERIAL_DESCRIPTION": ""})
+    fig.update_traces(text=[f"{v:.1f}%" for v in grp["MARGIN_PCT"]], textposition="inside")
+    fig.update_coloraxes(colorbar_title="Margin %")
+    return fig
+
+
+@safe
+def fig_fulfillment_rate(sales):
+    if sales.empty:
+        return empty_fig("No sales data yet")
+    df = sales.copy()
+    if "QUANTITY_DELIVERED" not in df.columns or "QUANTITY" not in df.columns:
+        return empty_fig("No delivery quantity data")
+    grp = df.groupby("SIM_ELAPSED_STEPS", as_index=False).agg(
+        Delivered=("QUANTITY_DELIVERED", "sum"), Ordered=("QUANTITY", "sum"))
+    grp["FULFILL_PCT"] = (grp["Delivered"] / grp["Ordered"] * 100).clip(upper=120).round(1)
+    grp = grp.sort_values("SIM_ELAPSED_STEPS")
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=grp["SIM_ELAPSED_STEPS"], y=grp["FULFILL_PCT"],
+                             name="Fulfillment Rate", mode="lines+markers",
+                             line=dict(color=GREEN, width=2),
+                             fill="tozeroy", fillcolor="rgba(46,204,113,0.08)"))
+    fig.add_hline(y=100, line_dash="dash", line_color="#fff",
+                  annotation_text="100% Perfect Fulfillment", annotation_font_color="#fff")
+    fig.add_hrect(y0=0, y1=80, fillcolor="rgba(231,76,60,0.08)", line_width=0,
+                  annotation_text="Below 80%", annotation_font_color=RED,
+                  annotation_position="bottom left")
+    fig.update_layout(yaxis_title="Fulfillment %", xaxis_title="Step",
+                      hovermode="x unified")
+    return fig
+
+
+@safe
+def fig_carbon_scope(carbon):
+    if carbon.empty:
+        return empty_fig("No carbon emissions data yet")
+    if "SCOPE" not in carbon.columns:
+        return empty_fig("No scope data in carbon emissions")
+    df = carbon.groupby(["SIM_ELAPSED_STEPS", "SCOPE"], as_index=False)["CO2E_EMISSIONS"].sum()
+    scope_colors = {"1": "#e74c3c", "2": "#f39c12", "3": "#3498db",
+                    "Scope 1": "#e74c3c", "Scope 2": "#f39c12", "Scope 3": "#3498db"}
+    fig = px.bar(df, x="SIM_ELAPSED_STEPS", y="CO2E_EMISSIONS", color="SCOPE",
+                 barmode="stack", color_discrete_map=scope_colors,
+                 color_discrete_sequence=[RED, YELLOW, ACCENT],
+                 labels={"SIM_ELAPSED_STEPS": "Step", "CO2E_EMISSIONS": "CO2e (kg)"})
+    fig.add_annotation(text="Scope 1=Direct | Scope 2=Energy | Scope 3=Supply Chain",
+                       xref="paper", yref="paper", x=0.5, y=1.08,
+                       showarrow=False, font=dict(color="#8b90a0", size=10))
+    fig.update_layout(hovermode="x unified",
+                      legend=dict(orientation="h", y=-0.2))
+    return fig
+
+
 def make_data_snapshot(lv, tr, tm, ik, ip_orders, pr, mkt):
     """Build a compact JSON-serialisable summary of current game state for AI context."""
     snap = {
@@ -1248,6 +1528,20 @@ app.layout = dbc.Container(fluid=True,
             ]),
         ]),
 
+        # Finance
+        dbc.Tab(label="Finance", tab_style={"color":"#8b90a0"}, active_tab_style={"color":"#fff"}, children=[
+            dbc.Row(className="mt-3 g-3", children=[
+                dbc.Col(chart_card("Cash Flow Projection", "g-cashflow",
+                                   fig_cashflow_projection(valuation, game_rules)), md=8),
+                dbc.Col(chart_card("Credit / Debt Monitor", "g-credit-rating",
+                                   fig_credit_rating(valuation)), md=4),
+            ]),
+            dbc.Row(className="mt-3 g-3", children=[
+                dbc.Col(chart_card("Income Statement Waterfall", "g-income-waterfall",
+                                   fig_income_waterfall(fin_post)), md=12),
+            ]),
+        ]),
+
         # Sales
         dbc.Tab(label="Sales", tab_style={"color":"#8b90a0"}, active_tab_style={"color":"#fff"}, children=[
             dbc.Row(className="mt-3 g-3", children=[
@@ -1255,8 +1549,14 @@ app.layout = dbc.Container(fluid=True,
                                    fig_revenue_by_product(sales)), md=6),
                 dbc.Col(chart_card("Sales Split by Region", "g-sales-region",
                                    fig_sales_by_region(sales)), md=3),
-                dbc.Col(chart_card("Wholesale vs Retail", "g-channel",
+                dbc.Col(chart_card("Sales by Distribution Channel", "g-channel",
                                    fig_channel_split(sales)), md=3),
+            ]),
+            dbc.Row(className="mt-3 g-3", children=[
+                dbc.Col(chart_card("Contribution Margin by Product", "g-contrib-margin",
+                                   fig_contribution_margin(sales)), md=6),
+                dbc.Col(chart_card("Order Fulfillment Rate", "g-fulfillment-rate",
+                                   fig_fulfillment_rate(sales)), md=6),
             ]),
         ]),
 
@@ -1279,6 +1579,10 @@ app.layout = dbc.Container(fluid=True,
                                    fig_inventory_kpi(inv_kpi)), md=7),
                 dbc.Col(chart_card("Days of Stock Available (avg steps)", "g-days-avail",
                                    fig_days_available(inv_kpi)), md=5),
+            ]),
+            dbc.Row(className="mt-3 g-3", children=[
+                dbc.Col(chart_card("Regional Stock Distribution (Finished Goods)", "g-regional-stock",
+                                   fig_regional_stock(transfers, inv_kpi)), md=12),
             ]),
         ]),
 
@@ -1325,6 +1629,22 @@ app.layout = dbc.Container(fluid=True,
                                    fig_yield_over_time_detail(prod)), md=4),
                 dbc.Col(chart_card("Total Units Produced by Product", "g-yield-product",
                                    fig_actual_yield_by_product(prod)), md=3),
+            ]),
+            dbc.Row(className="mt-3 g-3", children=[
+                dbc.Col(chart_card("Production Utilization %", "g-prod-utilization",
+                                   fig_production_utilization(prod, game_rules)), md=12),
+            ]),
+        ]),
+
+        # Procurement
+        dbc.Tab(label="Procurement", tab_style={"color":"#8b90a0"}, active_tab_style={"color":"#fff"}, children=[
+            dbc.Row(className="mt-3 g-3", children=[
+                dbc.Col(chart_card("Purchase Order Tracking", "g-po-tracking",
+                                   fig_po_tracking(pur_orders), height="400px"), md=12),
+            ]),
+            dbc.Row(className="mt-3 g-3", children=[
+                dbc.Col(chart_card("Supplier Price Comparison", "g-supplier-compare",
+                                   fig_supplier_comparison(suppliers, game_rules)), md=12),
             ]),
         ]),
 
@@ -1377,6 +1697,10 @@ app.layout = dbc.Container(fluid=True,
                 ], md=6),
                 dbc.Col(chart_card("Emissions by Type", "g-carbon-type",
                                    fig_carbon_by_type(carbon)), md=6),
+            ]),
+            dbc.Row(className="mt-3 g-3", children=[
+                dbc.Col(chart_card("Carbon Emissions by Scope", "g-carbon-scope",
+                                   fig_carbon_scope(carbon)), md=12),
             ]),
         ]),
     ]),
@@ -1467,6 +1791,17 @@ def toggle_auth(auth_data):
     Output("g-carbon-type",    "figure"),
     Output("g-carbon-time",    "figure"),
     Output("g-inv-hist",       "figure"),
+    # New graphs
+    Output("g-cashflow",          "figure"),
+    Output("g-income-waterfall",  "figure"),
+    Output("g-credit-rating",     "figure"),
+    Output("g-po-tracking",       "figure"),
+    Output("g-supplier-compare",  "figure"),
+    Output("g-regional-stock",    "figure"),
+    Output("g-prod-utilization",  "figure"),
+    Output("g-contrib-margin",    "figure"),
+    Output("g-fulfillment-rate",  "figure"),
+    Output("g-carbon-scope",      "figure"),
     # KPI rows
     Output("header-info",      "children"),
     Output("top-kpi-row",      "children"),
@@ -1484,11 +1819,11 @@ def toggle_auth(auth_data):
 )
 def refresh_all(n, auth_data):
     if not auth_data:
-        return tuple([no_update] * 34)
+        return tuple([no_update] * 44)
     auth     = (auth_data["username"], auth_data["password"])
     base_url = auth_data.get("base_url", BASE_URL)
     # Reload all data from OData
-    s, v, ik, mkt, c, p, po, ih, pr, pur, ir = load_all(auth, base_url)
+    s, v, ik, mkt, c, p, po, ih, pr, pur, ir, fp, sup, trf, gr = load_all(auth, base_url)
     (lv, tr, tm, tco2, ce, tp, ays,
      ip_orders, un_orders, pend, ttp, po) = compute_derived(s, v, ik, c, p, po)
 
@@ -1522,6 +1857,17 @@ def refresh_all(n, auth_data):
         sf(fig_carbon_by_type(c)),
         sf(fig_carbon_over_time(c)),
         sf(fig_inventory_history_by_type(ih)),
+        # New graphs
+        sf(fig_cashflow_projection(v, gr)),
+        sf(fig_income_waterfall(fp)),
+        sf(fig_credit_rating(v)),
+        sf(fig_po_tracking(pur)),
+        sf(fig_supplier_comparison(sup, gr)),
+        sf(fig_regional_stock(trf, ik)),
+        sf(fig_production_utilization(p, gr)),
+        sf(fig_contribution_margin(s)),
+        sf(fig_fulfillment_rate(s)),
+        sf(fig_carbon_scope(c)),
         make_header_info(lv),
         make_top_kpi_row(lv, tr, tm),
         make_prod_kpi_row(ttp, pend, ip_orders, un_orders, tp, ays),
