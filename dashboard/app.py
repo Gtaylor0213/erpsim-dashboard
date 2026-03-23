@@ -952,13 +952,25 @@ def fig_rm_coverage(inv_hist, pur_orders):
 
     rm = rm.groupby(["MATERIAL_NUMBER","MAT_TYPE"], as_index=False)["INVENTORY_OPENING_BALANCE"].sum()
 
-    # Average daily consumption: (max historical stock - current) / elapsed steps
-    elapsed = int(latest)
+    # Average daily consumption from recent inventory changes (last 5 steps for accuracy)
     rm_hist = inv_hist[inv_hist["MAT_TYPE"].isin(["Raw Materials","Packaging"])]
-    max_stock = rm_hist.groupby("MATERIAL_NUMBER")["INVENTORY_OPENING_BALANCE"].max().reset_index()
-    max_stock.rename(columns={"INVENTORY_OPENING_BALANCE":"MAX_STOCK"}, inplace=True)
-    rm = rm.merge(max_stock, on="MATERIAL_NUMBER", how="left")
-    rm["AVG_CONSUMPTION"] = ((rm["MAX_STOCK"] - rm["INVENTORY_OPENING_BALANCE"]) / elapsed).clip(lower=0.1)
+    lookback = max(5, 1)
+    recent_start = max(1, int(latest) - lookback)
+    consumption_rates = {}
+    for mat in rm["MATERIAL_NUMBER"].unique():
+        mh = rm_hist[rm_hist["MATERIAL_NUMBER"] == mat].sort_values("SIM_ELAPSED_STEPS")
+        recent = mh[mh["SIM_ELAPSED_STEPS"] >= recent_start]
+        if len(recent) >= 2:
+            stock_start = recent["INVENTORY_OPENING_BALANCE"].iloc[0]
+            stock_end = recent["INVENTORY_OPENING_BALANCE"].iloc[-1]
+            steps_span = recent["SIM_ELAPSED_STEPS"].iloc[-1] - recent["SIM_ELAPSED_STEPS"].iloc[0]
+            if steps_span > 0:
+                consumption_rates[mat] = max((stock_start - stock_end) / steps_span, 0.1)
+            else:
+                consumption_rates[mat] = 0.1
+        else:
+            consumption_rates[mat] = 0.1
+    rm["AVG_CONSUMPTION"] = rm["MATERIAL_NUMBER"].map(consumption_rates).fillna(0.1)
     rm["STEPS_COVERAGE"] = (rm["INVENTORY_OPENING_BALANCE"] / rm["AVG_CONSUMPTION"]).round(1)
 
     # Lead times from purchase order history
@@ -1063,8 +1075,17 @@ def fig_cashflow_projection(valuation, game_rules):
                                  fill="tozeroy", fillcolor="rgba(231,76,60,0.1)"))
     fig.add_hline(y=0, line_dash="dash", line_color=RED, annotation_text="Bankruptcy Line",
                   annotation_font_color=RED)
-    # Projected cash drain from overhead (Labor 20k + Mfg 15k + SGA 40k = 75k per 5 steps)
-    overhead_per_step = 75000 / 5  # 15k per step
+    # Pull overhead costs from game rules if available, else use job aid defaults
+    overhead_total = 75000  # default: Labor 20k + Mfg 15k + SGA 40k
+    if not game_rules.empty and "ELEMENT" in game_rules.columns and "DETAIL" in game_rules.columns:
+        oh = game_rules[game_rules["ELEMENT"].str.contains("Overhead_Cost", case=False, na=False)]
+        oh = oh[~oh["DETAIL"].str.contains("Frequency", case=False, na=False)]
+        if not oh.empty:
+            try:
+                overhead_total = oh["VALUE"].astype(float).sum()
+            except (ValueError, TypeError):
+                pass
+    overhead_per_step = overhead_total / 5  # billed every 5 steps
     if not df.empty:
         last_step = int(df["SIM_ELAPSED_STEPS"].max())
         last_cash = float(df["BANK_CASH_ACCOUNT"].iloc[-1])
@@ -1183,7 +1204,7 @@ def fig_supplier_comparison(suppliers, game_rules):
     if suppliers.empty:
         return empty_fig("No supplier price data yet")
     df = suppliers.copy()
-    vendor_col = "VENDOR" if "VENDOR" in df.columns else ("SUPPLIER" if "SUPPLIER" in df.columns else None)
+    vendor_col = "VENDOR_NAME" if "VENDOR_NAME" in df.columns else ("VENDOR_CODE" if "VENDOR_CODE" in df.columns else None)
     if vendor_col is None:
         return empty_fig("No vendor column in supplier data")
     mat_col = "MATERIAL_DESCRIPTION" if "MATERIAL_DESCRIPTION" in df.columns else "MATERIAL_NUMBER"
@@ -1220,10 +1241,10 @@ def fig_regional_stock(transfers, inv_kpi):
 def fig_production_utilization(prod, game_rules):
     if prod.empty:
         return empty_fig("No production data yet")
-    # Try to get capacity from game_rules
-    daily_capacity = 250000  # default
-    if not game_rules.empty and "VALUE" in game_rules.columns and "RULE" in game_rules.columns:
-        cap_row = game_rules[game_rules["RULE"].str.contains("Daily Production Capacity", case=False, na=False)]
+    # Get capacity from game_rules (CATEGORY=Rules, ELEMENT=Production, DETAIL=Daily Production Capacity)
+    daily_capacity = 24000  # correct default from job aid
+    if not game_rules.empty and "VALUE" in game_rules.columns and "DETAIL" in game_rules.columns:
+        cap_row = game_rules[game_rules["DETAIL"].str.contains("Daily Production Capacity", case=False, na=False)]
         if not cap_row.empty:
             try:
                 daily_capacity = float(cap_row.iloc[0]["VALUE"])
