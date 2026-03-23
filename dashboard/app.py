@@ -1511,8 +1511,14 @@ app.layout = dbc.Container(fluid=True,
     # Header
     dbc.Row(className="mb-3", children=[
         dbc.Col([
-            html.H2("ERPsim Dashboard",
-                    style={"color":"#fff","fontWeight":"700","marginBottom":"2px"}),
+            html.Div([
+                html.H2("ERPsim Dashboard",
+                        style={"color":"#fff","fontWeight":"700","marginBottom":"2px",
+                               "display":"inline-block"}),
+                dbc.Button("Refresh Now", id="manual-refresh-btn", size="sm", color="info",
+                           outline=True, className="ms-3",
+                           style={"fontSize":"0.72rem","padding":"2px 10px","verticalAlign":"middle"}),
+            ]),
             html.Div(id="header-subtitle",
                      children=html.Small("SAP Client 435 · UWM", className="text-muted")),
         ], width=8),
@@ -1849,9 +1855,10 @@ def toggle_auth(auth_data):
     Output("notifications-bar",   "children"),
     Output("data-snapshot",       "data"),
     Input("refresh", "n_intervals"),
+    Input("manual-refresh-btn", "n_clicks"),
     State("auth-store", "data"),
 )
-def refresh_all(n, auth_data):
+def refresh_all(n, _btn_clicks, auth_data):
     if not auth_data:
         return tuple([no_update] * 44)
     auth     = (auth_data["username"], auth_data["password"])
