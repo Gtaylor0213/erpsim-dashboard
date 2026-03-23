@@ -3,6 +3,7 @@ import json
 import anthropic
 import requests
 import pandas as pd
+from concurrent.futures import ThreadPoolExecutor
 import plotly.express as px
 import plotly.graph_objects as go
 import dash
@@ -73,21 +74,33 @@ def rs_to_elapsed(round_str, step_str):
 
 def load_all(auth, base_url=None):
     kw = dict(auth=auth, base_url=base_url)
-    sales       = fetch("Sales",                      **kw)
-    valuation   = fetch("Company_Valuation",          **kw)
-    inv_kpi     = fetch("Current_Inventory_KPI",      **kw)
-    market      = fetch("Market",                     **kw)
-    carbon      = fetch("Carbon_Emissions",           **kw)
-    prod        = fetch("Production",                 **kw)
-    prod_orders = fetch("Production_Orders",          **kw)
-    inv_hist    = fetch("Inventory",                  **kw)
-    pricing     = fetch("Current_Pricing_Conditions", **kw)
-    pur_orders  = fetch("Purchase_Orders",            **kw)
-    ind_req     = fetch("Independent_Requirements",   **kw)
-    fin_post    = fetch("Financial_Postings",         **kw)
-    suppliers   = fetch("Current_Suppliers_Prices",   **kw)
-    transfers   = fetch("Stock_Transfers",            **kw)
-    game_rules  = fetch("Current_Game_Rules",         **kw)
+    entities = [
+        "Sales", "Company_Valuation", "Current_Inventory_KPI", "Market",
+        "Carbon_Emissions", "Production", "Production_Orders", "Inventory",
+        "Current_Pricing_Conditions", "Purchase_Orders", "Independent_Requirements",
+        "Financial_Postings", "Current_Suppliers_Prices", "Stock_Transfers",
+        "Current_Game_Rules",
+    ]
+    results = {}
+    with ThreadPoolExecutor(max_workers=15) as pool:
+        futures = {pool.submit(fetch, e, **kw): e for e in entities}
+        for fut in futures:
+            results[futures[fut]] = fut.result()
+    sales       = results["Sales"]
+    valuation   = results["Company_Valuation"]
+    inv_kpi     = results["Current_Inventory_KPI"]
+    market      = results["Market"]
+    carbon      = results["Carbon_Emissions"]
+    prod        = results["Production"]
+    prod_orders = results["Production_Orders"]
+    inv_hist    = results["Inventory"]
+    pricing     = results["Current_Pricing_Conditions"]
+    pur_orders  = results["Purchase_Orders"]
+    ind_req     = results["Independent_Requirements"]
+    fin_post    = results["Financial_Postings"]
+    suppliers   = results["Current_Suppliers_Prices"]
+    transfers   = results["Stock_Transfers"]
+    game_rules  = results["Current_Game_Rules"]
 
     sales       = to_num(sales,       ["QUANTITY","QUANTITY_DELIVERED","NET_PRICE","NET_VALUE","COST","SIM_ELAPSED_STEPS","SIM_PERIOD"])
     valuation   = to_num(valuation,   ["BANK_CASH_ACCOUNT","ACCOUNTS_RECEIVABLE","BANK_LOAN",
