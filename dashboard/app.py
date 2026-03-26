@@ -888,6 +888,90 @@ def fig_sales_velocity(sales):
 
 
 @safe
+def fig_sales_prediction(sales):
+    """Predict future revenue per product using weighted linear regression with confidence bands."""
+    if sales.empty or "SIM_ELAPSED_STEPS" not in sales.columns:
+        return empty_fig("No sales data yet")
+
+    # Aggregate revenue per step per product
+    df = sales.groupby(["SIM_ELAPSED_STEPS", "MATERIAL_DESCRIPTION"], as_index=False).agg(
+        REVENUE=("NET_VALUE", "sum"), UNITS=("QUANTITY", "sum"))
+    current_step = int(df["SIM_ELAPSED_STEPS"].max())
+    forecast_horizon = 10
+    future_steps = np.arange(current_step + 1, current_step + forecast_horizon + 1)
+
+    fig = go.Figure()
+    total_predicted_revenue = 0
+
+    for i, (prod, grp) in enumerate(df.groupby("MATERIAL_DESCRIPTION")):
+        grp = grp.sort_values("SIM_ELAPSED_STEPS")
+        x = grp["SIM_ELAPSED_STEPS"].values.astype(float)
+        y = grp["REVENUE"].values.astype(float)
+        color = COLORS[i % len(COLORS)]
+
+        # Actual revenue line
+        fig.add_trace(go.Scatter(
+            x=x, y=y, name=prod, mode="lines+markers",
+            line=dict(color=color, width=2), marker=dict(size=4),
+            legendgroup=prod))
+
+        if len(x) < 3:
+            continue
+
+        # Weighted linear regression (recent data weighted 2x)
+        weights = np.ones(len(x))
+        weights[-min(5, len(weights)):] = 2.0  # weight last 5 steps more
+        coeffs = np.polyfit(x, y, deg=1, w=weights)
+        trend = np.poly1d(coeffs)
+
+        # Residuals for confidence band
+        residuals = y - trend(x)
+        std_err = np.std(residuals)
+
+        # Forecast
+        y_pred = trend(future_steps)
+        y_pred = np.maximum(y_pred, 0)  # revenue can't be negative
+        y_upper = y_pred + 1.5 * std_err
+        y_lower = np.maximum(y_pred - 1.5 * std_err, 0)
+
+        total_predicted_revenue += y_pred.sum()
+
+        # Trend line through historical data
+        fig.add_trace(go.Scatter(
+            x=x, y=trend(x), name=f"{prod} trend", mode="lines",
+            line=dict(color=color, width=1, dash="dot"),
+            legendgroup=prod, showlegend=False))
+
+        # Forecast line
+        fx = np.concatenate([[current_step], future_steps])
+        fy = np.concatenate([[y[-1]], y_pred])
+        fig.add_trace(go.Scatter(
+            x=fx, y=fy, name=f"{prod} forecast", mode="lines",
+            line=dict(color=color, width=2, dash="dash"),
+            legendgroup=prod, showlegend=False))
+
+        # Confidence band
+        fig.add_trace(go.Scatter(
+            x=np.concatenate([future_steps, future_steps[::-1]]),
+            y=np.concatenate([y_upper, y_lower[::-1]]),
+            fill="toself", fillcolor=color.replace(")", ",0.1)").replace("rgb", "rgba")
+                if color.startswith("rgb(") else f"rgba(200,200,200,0.1)",
+            line=dict(width=0), showlegend=False, legendgroup=prod,
+            hoverinfo="skip"))
+
+    fig.add_vline(x=current_step, line_dash="dot", line_color="#8b90a0",
+                  annotation_text="Now", annotation_font_color="#8b90a0")
+    fig.add_annotation(
+        x=current_step + forecast_horizon // 2, y=1.05, yref="paper",
+        text=f"Predicted next {forecast_horizon} steps: ~EUR {total_predicted_revenue:,.0f}",
+        showarrow=False, font=dict(color=ACCENT, size=12))
+    fig.update_layout(
+        hovermode="x unified", yaxis_title="Revenue (EUR)", xaxis_title="Step",
+        legend=dict(orientation="h", y=-0.2))
+    return fig
+
+
+@safe
 def fig_stockout_timeline(inv_kpi, prod_orders):
     """Horizontal bar: steps of FG stock remaining, vs when next production run delivers."""
     if inv_kpi.empty:
@@ -1532,6 +1616,29 @@ app.layout = dbc.Container(fluid=True,
         ], width=4),
     ]),
 
+    # ── Filter bar ──────────────────────────────────────────────────────────────
+    dbc.Row(className="mb-3 g-3", style={"background":CARD_BG,"borderRadius":"10px",
+            "padding":"10px 16px","border":"1px solid #2a2d3e"}, children=[
+        dbc.Col([
+            html.Small("ROUND", style={"color":"#8b90a0","fontSize":"0.7rem","letterSpacing":"0.05em"}),
+            dcc.Dropdown(id="filter-round", placeholder="All Rounds",
+                         style={"background":"#0f1117","color":"#fff","fontSize":"0.82rem"},
+                         className="dash-bootstrap"),
+        ], md=2),
+        dbc.Col([
+            html.Small("STEP RANGE", style={"color":"#8b90a0","fontSize":"0.7rem","letterSpacing":"0.05em"}),
+            dcc.RangeSlider(id="filter-steps", min=1, max=60, step=1, value=[1, 60],
+                            marks={1:"1", 10:"10", 20:"20", 30:"30", 40:"40", 50:"50", 60:"60"},
+                            tooltip={"placement":"bottom","always_visible":False}),
+        ], md=8),
+        dbc.Col([
+            html.Small("PRODUCT", style={"color":"#8b90a0","fontSize":"0.7rem","letterSpacing":"0.05em"}),
+            dcc.Dropdown(id="filter-product", placeholder="All Products", multi=True,
+                         style={"background":"#0f1117","color":"#fff","fontSize":"0.82rem"},
+                         className="dash-bootstrap"),
+        ], md=2),
+    ]),
+
     # Top KPI row
     dbc.Row(id="top-kpi-row", className="mb-3 g-3",
             children=make_top_kpi_row(latest_val, total_revenue, total_margin)),
@@ -1707,6 +1814,10 @@ app.layout = dbc.Container(fluid=True,
                                    fig_sales_velocity(sales)), md=12),
             ]),
             dbc.Row(className="mt-3 g-3", children=[
+                dbc.Col(chart_card("Revenue Prediction — Weighted Regression + Confidence Band", "g-sales-prediction",
+                                   fig_sales_prediction(sales)), md=12),
+            ]),
+            dbc.Row(className="mt-3 g-3", children=[
                 dbc.Col(chart_card("Finished Goods: Steps of Stock Remaining", "g-stockout-timeline",
                                    fig_stockout_timeline(inv_kpi, prod_orders), height=None), md=6),
                 dbc.Col(chart_card("RM & Packaging: Stock Coverage vs Lead Time", "g-rm-coverage",
@@ -1824,6 +1935,7 @@ def toggle_auth(auth_data):
     Output("g-price-heatmap",  "figure"),
     Output("g-price-bar",      "figure"),
     Output("g-sales-velocity",    "figure"),
+    Output("g-sales-prediction",  "figure"),
     Output("g-stockout-timeline", "figure"),
     Output("g-rm-coverage",       "figure"),
     Output("g-demand-vs-actual",  "figure"),
@@ -1854,19 +1966,82 @@ def toggle_auth(auth_data):
     Output("capacity-row",        "children"),
     Output("notifications-bar",   "children"),
     Output("data-snapshot",       "data"),
+    # Filter dropdowns (updated dynamically)
+    Output("filter-round",   "options"),
+    Output("filter-steps",   "max"),
+    Output("filter-steps",   "marks"),
+    Output("filter-product", "options"),
     Input("refresh", "n_intervals"),
     Input("manual-refresh-btn", "n_clicks"),
+    Input("filter-round",   "value"),
+    Input("filter-steps",   "value"),
+    Input("filter-product", "value"),
     State("auth-store", "data"),
 )
-def refresh_all(n, _btn_clicks, auth_data):
+def refresh_all(n, _btn_clicks, filt_round, filt_steps, filt_products, auth_data):
     if not auth_data:
-        return tuple([no_update] * 44)
+        return tuple([no_update] * 48)
     auth     = (auth_data["username"], auth_data["password"])
     base_url = auth_data.get("base_url", BASE_URL)
     # Reload all data from OData
     s, v, ik, mkt, c, p, po, ih, pr, pur, ir, fp, sup, trf, gr = load_all(auth, base_url)
+
+    # ── Build filter dropdown options from live data ──
+    round_opts = []
+    max_step = 60
+    if not v.empty and "SIM_ROUND" in v.columns:
+        rounds = sorted(v["SIM_ROUND"].dropna().unique())
+        round_opts = [{"label": f"Round {r}", "value": r} for r in rounds]
+    if not v.empty and "SIM_ELAPSED_STEPS" in v.columns:
+        max_step = int(v["SIM_ELAPSED_STEPS"].max())
+    step_marks = {i: str(i) for i in range(0, max_step + 1, max(1, max_step // 6))}
+    step_marks[max_step] = str(max_step)
+
+    product_opts = []
+    if not s.empty and "MATERIAL_DESCRIPTION" in s.columns:
+        prods = sorted(s["MATERIAL_DESCRIPTION"].dropna().unique())
+        product_opts = [{"label": p, "value": p} for p in prods]
+
+    # ── Apply filters to time-series entities ──
+    step_lo = filt_steps[0] if filt_steps else 1
+    step_hi = filt_steps[1] if filt_steps else max_step
+
+    def filt_time(df):
+        """Filter a DataFrame by round and step range (if columns exist)."""
+        if df.empty:
+            return df
+        out = df
+        if filt_round and "SIM_ROUND" in out.columns:
+            out = out[out["SIM_ROUND"] == filt_round]
+        if "SIM_ELAPSED_STEPS" in out.columns:
+            out = out[(out["SIM_ELAPSED_STEPS"] >= step_lo) & (out["SIM_ELAPSED_STEPS"] <= step_hi)]
+        return out
+
+    def filt_prod(df):
+        """Filter by selected products (if any)."""
+        if not filt_products or df.empty:
+            return df
+        if "MATERIAL_DESCRIPTION" in df.columns:
+            return df[df["MATERIAL_DESCRIPTION"].isin(filt_products)]
+        if "MATERIAL_NUMBER" in df.columns:
+            return df[df["MATERIAL_NUMBER"].isin(filt_products)]
+        return df
+
+    # Apply filters — time-series data gets both, snapshot entities get product filter only
+    sf_data = filt_prod(filt_time(s))
+    vf      = filt_time(v)
+    cf      = filt_time(c)
+    pf      = filt_prod(filt_time(p))
+    pof     = filt_prod(filt_time(po))
+    ihf     = filt_prod(filt_time(ih))
+    fpf     = filt_time(fp)
+    purf    = filt_prod(filt_time(pur))
+    trf_f   = filt_prod(filt_time(trf))
+    # Snapshot entities: use unfiltered for current state but filtered for charts
+    ikf     = filt_prod(ik)
+
     (lv, tr, tm, tco2, ce, tp, ays,
-     ip_orders, un_orders, pend, ttp, po) = compute_derived(s, v, ik, c, p, po)
+     ip_orders, un_orders, pend, ttp, po) = compute_derived(sf_data, vf, ikf, cf, pf, pof)
 
     card_body, border_color = current_in_production_card(ip_orders)
 
@@ -1874,51 +2049,57 @@ def refresh_all(n, _btn_clicks, auth_data):
         return style_fig(fig)
 
     return (
-        sf(fig_valuation_over_time(v)),
-        sf(fig_cash_and_debt(v)),
-        sf(fig_sales_by_period(s)),
-        sf(fig_production_over_time(p)),
-        sf(fig_revenue_by_product(s)),
-        sf(fig_sales_by_region(s)),
-        sf(fig_channel_split(s)),
-        sf(fig_inventory_kpi(ik)),
-        sf(fig_days_available(ik)),
-        sf(fig_prod_gantt(po, ce)),
-        sf(fig_setup_time(po)),
+        sf(fig_valuation_over_time(vf)),
+        sf(fig_cash_and_debt(vf)),
+        sf(fig_sales_by_period(sf_data)),
+        sf(fig_production_over_time(pf)),
+        sf(fig_revenue_by_product(sf_data)),
+        sf(fig_sales_by_region(sf_data)),
+        sf(fig_channel_split(sf_data)),
+        sf(fig_inventory_kpi(ikf)),
+        sf(fig_days_available(ikf)),
+        sf(fig_prod_gantt(pof, ce)),
+        sf(fig_setup_time(pof)),
         sf(fig_to_be_produced_by_product(pend)),
-        sf(fig_yield_over_time_detail(p)),
-        sf(fig_actual_yield_by_product(p)),
+        sf(fig_yield_over_time_detail(pf)),
+        sf(fig_actual_yield_by_product(pf)),
         sf(fig_price_heatmap(pr, mkt)),
         sf(fig_price_vs_market_bar(pr, mkt)),
-        sf(fig_sales_velocity(s)),
-        sf(fig_stockout_timeline(ik, po)),
-        sf(fig_rm_coverage(ih, pur)),
-        sf(fig_demand_vs_actual(ir, s)),
-        sf(fig_market_share(s, mkt)),
-        sf(fig_carbon_by_type(c)),
-        sf(fig_carbon_over_time(c)),
-        sf(fig_inventory_history_by_type(ih)),
+        sf(fig_sales_velocity(sf_data)),
+        sf(fig_sales_prediction(sf_data)),
+        sf(fig_stockout_timeline(ikf, pof)),
+        sf(fig_rm_coverage(ihf, purf)),
+        sf(fig_demand_vs_actual(ir, sf_data)),
+        sf(fig_market_share(sf_data, mkt)),
+        sf(fig_carbon_by_type(cf)),
+        sf(fig_carbon_over_time(cf)),
+        sf(fig_inventory_history_by_type(ihf)),
         # New graphs
-        sf(fig_cashflow_projection(v, gr)),
-        sf(fig_income_waterfall(fp)),
-        sf(fig_credit_rating(v)),
-        sf(fig_po_tracking(pur)),
+        sf(fig_cashflow_projection(vf, gr)),
+        sf(fig_income_waterfall(fpf)),
+        sf(fig_credit_rating(vf)),
+        sf(fig_po_tracking(purf)),
         sf(fig_supplier_comparison(sup, gr)),
-        sf(fig_regional_stock(trf, ik)),
-        sf(fig_production_utilization(p, gr)),
-        sf(fig_contribution_margin(s)),
-        sf(fig_fulfillment_rate(s)),
-        sf(fig_carbon_scope(c)),
+        sf(fig_regional_stock(trf_f, ikf)),
+        sf(fig_production_utilization(pf, gr)),
+        sf(fig_contribution_margin(sf_data)),
+        sf(fig_fulfillment_rate(sf_data)),
+        sf(fig_carbon_scope(cf)),
         make_header_info(lv),
         make_top_kpi_row(lv, tr, tm),
         make_prod_kpi_row(ttp, pend, ip_orders, un_orders, tp, ays),
-        make_sustain_kpi_row(c, tco2),
+        make_sustain_kpi_row(cf, tco2),
         card_body,
         up_next_card(un_orders, ce),
-        prod_order_table(po),
-        make_capacity_section(ih),
-        make_notifications(pur, ip_orders, ik),
-        make_data_snapshot(lv, tr, tm, ik, ip_orders, pr, mkt),
+        prod_order_table(pof),
+        make_capacity_section(ihf),
+        make_notifications(purf, ip_orders, ikf),
+        make_data_snapshot(lv, tr, tm, ikf, ip_orders, pr, mkt),
+        # Filter dropdown updates
+        round_opts,
+        max_step,
+        step_marks,
+        product_opts,
     )
 
 # ── Chat callbacks ─────────────────────────────────────────────────────────────
