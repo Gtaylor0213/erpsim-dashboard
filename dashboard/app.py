@@ -738,15 +738,19 @@ def prod_order_table(order_df):
         return html.P("None", className="text-muted", style={"padding":"10px"})
     rows = []
     for _, r in order_df.iterrows():
-        status_color = STATUS_COLORS.get(r["STATUS"], "#8b90a0")
+        status = r.get("STATUS", "—") if "STATUS" in order_df.columns else "—"
+        status_color = STATUS_COLORS.get(status, "#8b90a0")
+        begin_label = r.get("BEGIN_LABEL", "—") if "BEGIN_LABEL" in order_df.columns else "—"
+        end_label = r.get("END_LABEL", "—") if "END_LABEL" in order_df.columns else "—"
+        setup = int(r["SETUP_TIME"]) if "SETUP_TIME" in order_df.columns and pd.notna(r.get("SETUP_TIME")) else 0
         rows.append(html.Tr([
-            html.Td(r["PRODUCTION_ORDER"],          style={"color":"#8b90a0","fontSize":"0.8rem","padding":"6px 8px"}),
-            html.Td(r["MATERIAL_DESCRIPTION"],      style={"color":"#c8cdd8","padding":"6px 8px","fontWeight":"500"}),
-            html.Td(f"{int(r['TARGET_QUANTITY']):,}", style={"color":ACCENT,"textAlign":"right","padding":"6px 8px"}),
-            html.Td(r["BEGIN_LABEL"],               style={"color":"#8b90a0","textAlign":"center","padding":"6px 8px"}),
-            html.Td(r["END_LABEL"],                 style={"color":"#8b90a0","textAlign":"center","padding":"6px 8px"}),
-            html.Td(f"{int(r['SETUP_TIME'])}",       style={"color":YELLOW if r['SETUP_TIME']>0 else "#8b90a0","textAlign":"center","padding":"6px 8px"}),
-            html.Td(r["STATUS"],                    style={"color":status_color,"fontWeight":"600","padding":"6px 8px"}),
+            html.Td(r.get("PRODUCTION_ORDER","—"),    style={"color":"#8b90a0","fontSize":"0.8rem","padding":"6px 8px"}),
+            html.Td(r.get("MATERIAL_DESCRIPTION","—"),style={"color":"#c8cdd8","padding":"6px 8px","fontWeight":"500"}),
+            html.Td(f"{int(r.get('TARGET_QUANTITY',0)):,}", style={"color":ACCENT,"textAlign":"right","padding":"6px 8px"}),
+            html.Td(begin_label,                      style={"color":"#8b90a0","textAlign":"center","padding":"6px 8px"}),
+            html.Td(end_label,                        style={"color":"#8b90a0","textAlign":"center","padding":"6px 8px"}),
+            html.Td(f"{setup}",                       style={"color":YELLOW if setup>0 else "#8b90a0","textAlign":"center","padding":"6px 8px"}),
+            html.Td(status,                           style={"color":status_color,"fontWeight":"600","padding":"6px 8px"}),
         ]))
     header = html.Tr([
         html.Th(h, style={"color":"#8b90a0","fontSize":"0.72rem","textTransform":"uppercase",
