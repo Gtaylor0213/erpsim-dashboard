@@ -1521,9 +1521,44 @@ def make_sustain_kpi_row(carbon, total_co2):
     ]
 
 # ── App ────────────────────────────────────────────────────────────────────────
+import time as _time
+_CACHE_BUST = str(int(_time.time()))
+
 app = dash.Dash(__name__, external_stylesheets=[dbc.themes.CYBORG],
-                title="ERPsim Dashboard")
+                title="ERPsim Dashboard",
+                meta_tags=[{"http-equiv": "Cache-Control", "content": "no-cache, no-store, must-revalidate"},
+                           {"http-equiv": "Pragma", "content": "no-cache"},
+                           {"http-equiv": "Expires", "content": "0"}])
+app.config.suppress_callback_exceptions = True
 server = app.server
+
+# Force fresh JS/CSS on every server restart — prevents stale callback signature errors
+app.index_string = '''<!DOCTYPE html>
+<html>
+    <head>
+        {%metas%}
+        <title>{%title%}</title>
+        {%favicon%}
+        {%css%}
+        <script>
+            sessionStorage.clear();
+            // Force reload once per server restart to bust stale Dash JS callback map
+            var v = "''' + _CACHE_BUST + '''";
+            if (localStorage.getItem("erpsim_v") !== v) {
+                localStorage.setItem("erpsim_v", v);
+                location.reload(true);
+            }
+        </script>
+    </head>
+    <body>
+        {%app_entry%}
+        <footer>
+            {%config%}
+            {%scripts%}
+            {%renderer%}
+        </footer>
+    </body>
+</html>'''
 
 app.layout = dbc.Container(fluid=True,
     style={"backgroundColor": BG, "minHeight":"100vh", "padding":"20px"}, children=[
