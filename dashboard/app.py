@@ -1992,6 +1992,7 @@ def toggle_auth(auth_data):
     Output("filter-round",   "options"),
     Output("filter-steps",   "max"),
     Output("filter-steps",   "marks"),
+    Output("filter-steps",   "value"),
     Output("filter-product", "options"),
     Input("refresh", "n_intervals"),
     Input("manual-refresh-btn", "n_clicks"),
@@ -2002,7 +2003,7 @@ def toggle_auth(auth_data):
 )
 def refresh_all(n, _btn_clicks, filt_round, filt_steps, filt_products, auth_data):
     if not auth_data:
-        return tuple([no_update] * 49)
+        return tuple([no_update] * 50)
     auth     = (auth_data["username"], auth_data["password"])
     base_url = auth_data.get("base_url", BASE_URL)
     # Reload all data from OData
@@ -2025,8 +2026,14 @@ def refresh_all(n, _btn_clicks, filt_round, filt_steps, filt_products, auth_data
         product_opts = [{"label": p, "value": p} for p in prods]
 
     # ── Apply filters to time-series entities ──
+    # When a round is selected, auto-scope step range to that round's steps
     step_lo = filt_steps[0] if filt_steps else 1
     step_hi = filt_steps[1] if filt_steps else max_step
+    if filt_round and not v.empty and "SIM_ROUND" in v.columns and "SIM_ELAPSED_STEPS" in v.columns:
+        round_data = v[v["SIM_ROUND"] == filt_round]
+        if not round_data.empty:
+            step_lo = max(step_lo, int(round_data["SIM_ELAPSED_STEPS"].min()))
+            step_hi = min(step_hi, int(round_data["SIM_ELAPSED_STEPS"].max()))
 
     def filt_time(df):
         """Filter a DataFrame by round and step range (if columns exist)."""
@@ -2122,6 +2129,7 @@ def refresh_all(n, _btn_clicks, filt_round, filt_steps, filt_products, auth_data
         round_opts,
         max_step,
         step_marks,
+        [step_lo, max(step_hi, max_step)] if step_hi >= (max_step - 5) else no_update,
         product_opts,
     )
 
