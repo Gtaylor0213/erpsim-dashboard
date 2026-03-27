@@ -12,7 +12,7 @@ import dash_bootstrap_components as dbc
 
 # ── Config ────────────────────────────────────────────────────────────────────
 BASE_URL      = "http://twister.ucc.uwm.edu/odata/407"
-AUTH          = ("V_3", "bobcats26")
+AUTH          = ("V_2", "bobcats26")
 REFRESH_S     = 20
 ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
