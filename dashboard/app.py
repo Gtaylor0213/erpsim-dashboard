@@ -530,6 +530,23 @@ def fig_price_vs_market_bar(pricing, market):
     return fig
 
 @safe
+def fig_current_prices(pricing):
+    """Grouped bar: our current prices by product and distribution channel."""
+    if pricing.empty or "PRICE" not in pricing.columns:
+        return empty_fig("No pricing data yet")
+    df = to_num(pricing.copy(), ["PRICE"])
+    if df["PRICE"].dropna().empty:
+        return empty_fig("No pricing data yet")
+    label_col = "DC_NAME" if "DC_NAME" in df.columns else "DISTRIBUTION_CHANNEL"
+    fig = px.bar(df, x="MATERIAL_DESCRIPTION", y="PRICE", color=label_col,
+                 barmode="group", text="PRICE",
+                 labels={"MATERIAL_DESCRIPTION": "", "PRICE": "Price (EUR)", label_col: "Channel"})
+    fig.update_traces(texttemplate="€%{text:.2f}", textposition="outside", textfont_size=10)
+    fig.update_layout(yaxis_title="Price (EUR)", xaxis_tickangle=-35, hovermode="x unified",
+                      legend=dict(orientation="h", y=-0.25))
+    return fig
+
+@safe
 def fig_market_share(sales, market):
     our  = sales.groupby(["SIM_PERIOD","MATERIAL_DESCRIPTION"], as_index=False)["QUANTITY"].sum()
     our.rename(columns={"QUANTITY":"OurQty"}, inplace=True)
@@ -1798,6 +1815,10 @@ app.layout = dbc.Container(fluid=True,
         # Pricing
         dbc.Tab(label="Pricing", tab_style={"color":"#8b90a0"}, active_tab_style={"color":"#fff"}, children=[
             dbc.Row(className="mt-3 g-3", children=[
+                dbc.Col(chart_card("Current Prices by Channel & Product", "g-current-prices",
+                                   fig_current_prices(pricing)), md=12),
+            ]),
+            dbc.Row(className="mt-3 g-3", children=[
                 dbc.Col(chart_card("Our Price vs Market Average — Heatmap", "g-price-heatmap",
                                    fig_price_heatmap(pricing, market), height=None), md=12),
             ]),
@@ -1932,6 +1953,7 @@ def toggle_auth(auth_data):
     Output("g-to-produce",     "figure"),
     Output("g-yield-time",     "figure"),
     Output("g-yield-product",  "figure"),
+    Output("g-current-prices", "figure"),
     Output("g-price-heatmap",  "figure"),
     Output("g-price-bar",      "figure"),
     Output("g-sales-velocity",    "figure"),
@@ -1980,7 +2002,7 @@ def toggle_auth(auth_data):
 )
 def refresh_all(n, _btn_clicks, filt_round, filt_steps, filt_products, auth_data):
     if not auth_data:
-        return tuple([no_update] * 48)
+        return tuple([no_update] * 49)
     auth     = (auth_data["username"], auth_data["password"])
     base_url = auth_data.get("base_url", BASE_URL)
     # Reload all data from OData
@@ -2063,6 +2085,7 @@ def refresh_all(n, _btn_clicks, filt_round, filt_steps, filt_products, auth_data
         sf(fig_to_be_produced_by_product(pend)),
         sf(fig_yield_over_time_detail(pf)),
         sf(fig_actual_yield_by_product(pf)),
+        sf(fig_current_prices(pr)),
         sf(fig_price_heatmap(pr, mkt)),
         sf(fig_price_vs_market_bar(pr, mkt)),
         sf(fig_sales_velocity(sf_data)),
