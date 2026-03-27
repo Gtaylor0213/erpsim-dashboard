@@ -11,7 +11,8 @@ from dash import dcc, html, Input, Output, State, callback, no_update
 import dash_bootstrap_components as dbc
 
 # ── Config ────────────────────────────────────────────────────────────────────
-BASE_URL      = "http://uno.ucc.uwm.edu/odata/435"
+BASE_URL      = "http://twister.ucc.uwm.edu/odata/407"
+AUTH          = ("V_3", "bobcats26")
 REFRESH_S     = 20
 ANTHROPIC_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 
@@ -72,8 +73,8 @@ def rs_to_elapsed(round_str, step_str):
     except Exception:
         return 0
 
-def load_all(auth, base_url=None):
-    kw = dict(auth=auth, base_url=base_url)
+def load_all(auth=None, base_url=None):
+    kw = dict(auth=auth or AUTH, base_url=base_url or BASE_URL)
     entities = [
         "Sales", "Company_Valuation", "Current_Inventory_KPI", "Market",
         "Carbon_Emissions", "Production", "Production_Orders", "Inventory",
@@ -1524,46 +1525,12 @@ app = dash.Dash(__name__, external_stylesheets=[dbc.themes.CYBORG],
                 title="ERPsim Dashboard")
 server = app.server
 
-_LOGIN_OVERLAY = html.Div(id="login-overlay", style={
-    "position":"fixed","top":0,"left":0,"width":"100%","height":"100%",
-    "backgroundColor":"#0f1117","zIndex":9999,
-    "display":"flex","alignItems":"center","justifyContent":"center",
-}, children=[
-    dbc.Card(style={"width":"420px","background":"#1a1d27","border":"1px solid #2a2d3e","borderRadius":"12px"},
-    children=[
-        dbc.CardBody([
-            html.H4("ERPsim Dashboard", className="text-white text-center mb-1",
-                    style={"fontWeight":"700"}),
-            html.P("Connect to your SAP OData server", className="text-muted text-center mb-4",
-                   style={"fontSize":"0.85rem"}),
-            dbc.Label("OData URL", style={"color":"#8b90a0","fontSize":"0.82rem"}),
-            dbc.Input(id="input-url", value=BASE_URL, type="text",
-                      className="mb-3",
-                      style={"background":"#0f1117","color":"#fff","border":"1px solid #2a2d3e",
-                             "fontSize":"0.82rem"}),
-            dbc.Label("Username", style={"color":"#8b90a0","fontSize":"0.82rem"}),
-            dbc.Input(id="input-username", placeholder="e.g. A_1", type="text",
-                      className="mb-3",
-                      style={"background":"#0f1117","color":"#fff","border":"1px solid #2a2d3e"}),
-            dbc.Label("Password", style={"color":"#8b90a0","fontSize":"0.82rem"}),
-            dbc.Input(id="input-password", placeholder="Password", type="password",
-                      className="mb-3",
-                      style={"background":"#0f1117","color":"#fff","border":"1px solid #2a2d3e"}),
-            dbc.Button("Connect", id="login-btn", color="primary", className="w-100 mb-2"),
-            html.Div(id="login-status", className="text-center",
-                     style={"color":RED,"fontSize":"0.83rem","minHeight":"20px"}),
-        ])
-    ])
-])
-
 app.layout = dbc.Container(fluid=True,
     style={"backgroundColor": BG, "minHeight":"100vh", "padding":"20px"}, children=[
 
-    dcc.Store(id="auth-store",     storage_type="session"),
     dcc.Store(id="data-snapshot",  storage_type="memory"),
     dcc.Store(id="chat-history",   storage_type="memory", data=[]),
     dcc.Interval(id="refresh", interval=REFRESH_S * 1000, n_intervals=0),
-    _LOGIN_OVERLAY,
 
     # ── Floating AI chat panel ──────────────────────────────────────────────────
     html.Div(style={"position":"fixed","bottom":"24px","right":"24px","zIndex":4000}, children=[
@@ -1606,9 +1573,6 @@ app.layout = dbc.Container(fluid=True,
         ]),
     ]),
 
-    # Main dashboard (hidden until logged in)
-    html.Div(id="main-content", style={"display":"none"}, children=[
-
     # Header
     dbc.Row(className="mb-3", children=[
         dbc.Col([
@@ -1620,16 +1584,11 @@ app.layout = dbc.Container(fluid=True,
                            outline=True, className="ms-3",
                            style={"fontSize":"0.72rem","padding":"2px 10px","verticalAlign":"middle"}),
             ]),
-            html.Div(id="header-subtitle",
-                     children=html.Small("SAP Client 435 · UWM", className="text-muted")),
+            html.Small(f"Team {AUTH[0].split('_')[0]} · SAP Client 407 · UWM", className="text-muted"),
         ], width=8),
         dbc.Col([
-            html.Div([
-                html.Div(id="header-info", children=make_header_info(latest_val),
-                         className="mb-1"),
-                dbc.Button("Switch Team", id="logout-btn", size="sm", color="secondary",
-                           outline=True, style={"fontSize":"0.72rem","padding":"2px 10px"}),
-            ], className="text-end mt-1"),
+            html.Div(id="header-info", children=make_header_info(latest_val),
+                     className="text-end mt-2"),
         ], width=4),
     ]),
 
@@ -1878,63 +1837,9 @@ app.layout = dbc.Container(fluid=True,
     ]),
 
     html.Hr(style={"borderColor":"#2a2d3e","marginTop":"30px"}),
-    html.P(f"Auto-refreshes every {REFRESH_S}s  ·  Data: SAP NetWeaver OData · Client 435",
+    html.P(f"Auto-refreshes every {REFRESH_S}s  ·  Data: SAP NetWeaver OData · Client 407",
            className="text-center text-muted", style={"fontSize":"0.75rem"}),
-
-    ]),  # end main-content
 ])
-
-# ── Login callback ─────────────────────────────────────────────────────────────
-@callback(
-    Output("auth-store",    "data"),
-    Output("login-status",  "children"),
-    Input("login-btn",      "n_clicks"),
-    State("input-url",      "value"),
-    State("input-username", "value"),
-    State("input-password", "value"),
-    prevent_initial_call=True,
-)
-def do_login(n_clicks, base_url, username, password):
-    if not base_url or not username or not password:
-        return no_update, "Please fill in all fields."
-    base_url  = base_url.rstrip("/")
-    username  = username.strip()
-    password  = password.strip()
-    try:
-        r = requests.get(f"{base_url}/Company_Valuation", auth=(username, password),
-                         params={"$format":"json","$top":"1"}, timeout=10)
-        if r.status_code == 200:
-            team = username.split("_")[0].upper()
-            return {"base_url": base_url, "username": username,
-                    "password": password, "team": team}, ""
-        return no_update, f"Login failed — check credentials (HTTP {r.status_code})."
-    except Exception as e:
-        return no_update, f"Connection error: {e}"
-
-@callback(
-    Output("auth-store", "data", allow_duplicate=True),
-    Input("logout-btn", "n_clicks"),
-    prevent_initial_call=True,
-)
-def do_logout(n):
-    return None
-
-@callback(
-    Output("login-overlay", "style"),
-    Output("main-content",  "style"),
-    Output("header-subtitle", "children"),
-    Input("auth-store", "data"),
-)
-def toggle_auth(auth_data):
-    hidden  = {"display":"none"}
-    overlay = {"position":"fixed","top":0,"left":0,"width":"100%","height":"100%",
-                "backgroundColor":"#0f1117","zIndex":9999,
-                "display":"flex","alignItems":"center","justifyContent":"center"}
-    if auth_data:
-        team = auth_data.get("team","?")
-        subtitle = html.Small(f"Team {team} · SAP Client 435 · UWM", className="text-muted")
-        return hidden, {"display":"block"}, subtitle
-    return overlay, hidden, no_update
 
 # ── Live refresh callback ──────────────────────────────────────────────────────
 @callback(
@@ -1999,15 +1904,10 @@ def toggle_auth(auth_data):
     Input("filter-round",   "value"),
     Input("filter-steps",   "value"),
     Input("filter-product", "value"),
-    State("auth-store", "data"),
 )
-def refresh_all(n, _btn_clicks, filt_round, filt_steps, filt_products, auth_data):
-    if not auth_data:
-        return tuple([no_update] * 50)
-    auth     = (auth_data["username"], auth_data["password"])
-    base_url = auth_data.get("base_url", BASE_URL)
+def refresh_all(n, _btn_clicks, filt_round, filt_steps, filt_products):
     # Reload all data from OData
-    s, v, ik, mkt, c, p, po, ih, pr, pur, ir, fp, sup, trf, gr = load_all(auth, base_url)
+    s, v, ik, mkt, c, p, po, ih, pr, pur, ir, fp, sup, trf, gr = load_all()
 
     # ── Build filter dropdown options from live data ──
     round_opts = []
